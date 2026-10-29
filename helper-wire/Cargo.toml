@@ -3,11 +3,13 @@ name = "amaterasu-vkms-frame-helper"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-autobins = false
-autotests = false
 [lib]
 name = "amaterasu_vkms_frame_helper"
 path = "src/lib.rs"
+
+[[bin]]
+name = "amaterasu-vkms-frame-helper"
+path = "src/main.rs"
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 [lints.rust]
