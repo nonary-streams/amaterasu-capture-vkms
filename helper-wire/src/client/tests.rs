@@ -68,6 +68,7 @@ fn descriptor(plane_count: u32, fence_mask: u32) -> FrameDescriptor {
         pitches,
         offsets: [0; MAX_PLANES],
         fence_mask,
+        guard_count: 0,
         color: 1,
         hdr_metadata: [0; 12],
     }
@@ -295,4 +296,33 @@ fn a_shutdown_handle_interrupts_a_pending_wait() {
     assert!(matches!(result, Err(ClientError::Closed)));
     assert!(waited < Duration::from_millis(500));
     assert!(!client.is_usable());
+}
+
+#[test]
+#[cfg(feature = "driver-read-leases")]
+fn read_guard_survives_helper_reply_until_source_frame_is_dropped() {
+    let (buffer, _) = pipe();
+    let (guard, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(std::time::Duration::from_millis(10)))
+        .unwrap();
+    let (mut client, thread) = fake_helper(vec![Box::new(move |request| {
+        let mut layout = descriptor(1, 0);
+        layout.guard_count = 1;
+        Some((
+            reply(request, Reply::FrameReady(layout)),
+            vec![buffer.into(), guard.into()],
+        ))
+    })]);
+    let FrameExport::Ready(frame) = client.frame(41).unwrap() else {
+        panic!("missing frame")
+    };
+    thread.join().unwrap();
+    assert_eq!(frame.read_guards.len(), 1);
+    let mut byte = [0];
+    assert!(matches!(
+        peer.read(&mut byte).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ));
+    drop(frame);
+    assert_eq!(peer.read(&mut byte).unwrap(), 0);
 }

@@ -13,6 +13,7 @@ fn frame() -> FrameDescriptor {
         pitches: [7680, 3840, 0, 0],
         offsets: [0, 4096, 0, 0],
         fence_mask: 0b01,
+        guard_count: 0,
 
         color: 1,
         hdr_metadata: [0; 12],
@@ -272,4 +273,23 @@ fn every_failure_has_a_distinct_code() {
         .collect();
     assert_eq!(codes.len(), 13);
     assert_eq!(Failure::from_wire(14), None);
+}
+
+#[test]
+#[cfg(feature = "driver-read-leases")]
+fn read_guard_count_round_trips_and_cannot_exceed_source_planes() {
+    let mut layout = frame();
+    layout.guard_count = layout.plane_count;
+    let record = ResponseRecord {
+        request_id: 1,
+        opcode: Opcode::Frame as u16,
+        reply: Reply::FrameReady(layout),
+    };
+    assert_eq!(decode_response(&encode_response(&record)).unwrap(), record);
+    layout.guard_count += 1;
+    let invalid = ResponseRecord {
+        reply: Reply::FrameReady(layout),
+        ..record
+    };
+    assert!(decode_response(&encode_response(&invalid)).is_err());
 }

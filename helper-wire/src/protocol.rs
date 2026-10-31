@@ -6,14 +6,14 @@
 //! helper touches the device. A successful frame response carries descriptors
 //! in one SCM_RIGHTS message: the DMA-BUF of each plane in plane order,
 //! followed by the sync_file of each plane whose bit is set in `fence_mask`,
-//! also in plane order.
+//! also in plane order, then the driver read-guard descriptors.
 
 /// Version 1 uses the released WAIT_PRESENT / GET_FRAME interface.
 /// The opt-in version 2 requires driver-backed source read leases for FRAME.
 #[cfg(not(feature = "driver-read-leases"))]
 pub const PROTOCOL_VERSION: u16 = 1;
 #[cfg(feature = "driver-read-leases")]
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const REQUEST_MAGIC: u32 = u32::from_le_bytes(*b"AVFQ");
 pub const RESPONSE_MAGIC: u32 = u32::from_le_bytes(*b"AVFR");
 pub const REQUEST_LEN: usize = 48;
@@ -23,7 +23,12 @@ pub const RESPONSE_LEN: usize = 128;
 pub const RESPONSE_LEN: usize = 160;
 pub const MAX_PLANES: usize = 4;
 /// One DMA-BUF and at most one sync_file per plane.
-pub const MAX_RESPONSE_DESCRIPTORS: usize = MAX_PLANES * 2;
+pub const MAX_RESPONSE_DESCRIPTORS: usize = MAX_PLANES
+    * if cfg!(feature = "driver-read-leases") {
+        3
+    } else {
+        2
+    };
 /// The driver rejects longer waits; the helper rejects them first.
 pub const MAX_WAIT_TIMEOUT_MS: u32 = 1000;
 
@@ -182,6 +187,8 @@ pub struct FrameDescriptor {
     pub offsets: [u32; MAX_PLANES],
     /// Bit `i` set when plane `i` has an acquire sync_file.
     pub fence_mask: u32,
+    /// Driver read guards, kept separate from GPU-importable native DMA-BUFs.
+    pub guard_count: u32,
     /// 0 unknown, 1 sRGB, 2 BT.2020/PQ; never inferred from bit depth.
     pub color: u32,
     /// RGB xy, white xy, maximum/minimum luminance, MaxCLL and MaxFALL.
@@ -191,7 +198,9 @@ pub struct FrameDescriptor {
 impl FrameDescriptor {
     /// Number of SCM_RIGHTS descriptors that accompany this frame.
     pub fn descriptor_count(&self) -> usize {
-        self.plane_count as usize + self.fence_mask.count_ones() as usize
+        self.plane_count as usize
+            + self.fence_mask.count_ones() as usize
+            + self.guard_count as usize
     }
 
     pub fn has_fence(&self, plane: usize) -> bool {
@@ -211,6 +220,8 @@ impl FrameDescriptor {
             && self.height != 0
             && self.fourcc != 0
             && self.fence_mask & !used_mask == 0
+            && self.guard_count <= self.plane_count
+            && (cfg!(feature = "driver-read-leases") || self.guard_count == 0)
             && self.color <= 2
             && (self.color == 2 || self.hdr_metadata == [0; 12]);
         if !shape_valid {
@@ -338,7 +349,9 @@ mod response_layout {
     #[cfg(not(feature = "driver-read-leases"))]
     pub const RESERVED: std::ops::Range<usize> = 104..super::RESPONSE_LEN;
     #[cfg(feature = "driver-read-leases")]
-    pub const RESERVED: std::ops::Range<usize> = 132..super::RESPONSE_LEN;
+    pub const RESERVED: std::ops::Range<usize> = 136..super::RESPONSE_LEN;
+    #[cfg(feature = "driver-read-leases")]
+    pub const GUARD_COUNT: usize = 132;
     /// Everything after the common header; used to check unused body fields.
     pub const BODY: std::ops::Range<usize> = RESULT_FLAGS..super::RESPONSE_LEN;
 }
@@ -462,6 +475,7 @@ pub fn encode_response(record: &ResponseRecord) -> [u8; RESPONSE_LEN] {
             #[cfg(feature = "driver-read-leases")]
             {
                 writer.u32(COLOR, frame.color);
+                writer.u32(GUARD_COUNT, frame.guard_count);
                 for (index, value) in frame.hdr_metadata.into_iter().enumerate() {
                     writer.u16(HDR + index * 2, value);
                 }
@@ -565,6 +579,7 @@ fn decode_success(reader: &RecordReader<'_>, opcode: Opcode) -> Result<Reply, Ma
                 pitches: [0; MAX_PLANES],
                 offsets: [0; MAX_PLANES],
                 fence_mask: reader.u32(FENCE_MASK),
+                guard_count: 0,
                 color: if cfg!(feature = "driver-read-leases") {
                     reader.u32(COLOR)
                 } else {
@@ -579,6 +594,10 @@ fn decode_success(reader: &RecordReader<'_>, opcode: Opcode) -> Result<Reply, Ma
             #[cfg(feature = "driver-read-leases")]
             for (index, value) in frame.hdr_metadata.iter_mut().enumerate() {
                 *value = reader.u16(HDR + index * 2);
+            }
+            #[cfg(feature = "driver-read-leases")]
+            {
+                frame.guard_count = reader.u32(GUARD_COUNT);
             }
             frame.validate().map_err(|()| MalformedResponse)?;
             Ok(Reply::FrameReady(frame))

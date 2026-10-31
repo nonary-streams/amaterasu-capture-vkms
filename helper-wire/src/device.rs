@@ -63,7 +63,6 @@ pub const VIBESHINE_IOCTL_WAIT_PRESENT: u32 = drm_ioctl(
     DRM_COMMAND_BASE,
     size_of::<WaitPresentRecord>(),
 );
-#[cfg(any(not(feature = "driver-read-leases"), test))]
 pub const VIBESHINE_IOCTL_GET_FRAME: u32 = drm_ioctl(
     IOC_READ | IOC_WRITE,
     DRM_COMMAND_BASE + 1,
@@ -121,7 +120,24 @@ impl PresentationCard for VibeshineCard {
         #[cfg(not(feature = "driver-read-leases"))]
         let request = VIBESHINE_IOCTL_GET_FRAME;
         unsafe { ioctl_record(&self.device, request, &mut record) }?;
-        Ok(take_frame(record))
+        let guarded = take_frame(record);
+        #[cfg(not(feature = "driver-read-leases"))]
+        return Ok(guarded);
+        #[cfg(feature = "driver-read-leases")]
+        {
+            if guarded.flags == (1 << 1) {
+                return Ok(guarded);
+            }
+            let mut native = FrameRecord {
+                abi_version: DRIVER_ABI_VERSION,
+                crtc_id,
+                ..FrameRecord::default()
+            };
+            // SAFETY: the initialized ABI-1 record and its returned descriptors
+            // remain owned here. `guarded` keeps producer storage from retiring.
+            unsafe { ioctl_record(&self.device, VIBESHINE_IOCTL_GET_FRAME, &mut native) }?;
+            native_with_read_guards(guarded, take_frame(native))
+        }
     }
 
     fn wait_present(
@@ -172,6 +188,7 @@ fn take_frame(record: FrameRecord) -> DriverFrame {
         modifier: record.modifier,
         plane_count: record.plane_count,
         dma_bufs: record.dma_buf_fds.map(own),
+        read_guards: Default::default(),
         pitches: record.pitches,
         offsets: record.offsets,
         sync_files: record.sync_file_fds.map(own),
@@ -199,6 +216,38 @@ fn take_frame(record: FrameRecord) -> DriverFrame {
             [0; 12]
         },
     }
+}
+
+/// Pair a native exporter with guards for the same completed presentation.
+/// Any mismatch drops both sets of owned descriptors; the caller retries later.
+#[cfg(feature = "driver-read-leases")]
+fn native_with_read_guards(
+    mut guarded: DriverFrame,
+    mut native: DriverFrame,
+) -> io::Result<DriverFrame> {
+    let same = native.abi_version == DRIVER_ABI_VERSION
+        && native.reserved_zero
+        && native.flags == 1
+        && guarded.flags == 5
+        && native.crtc_id == guarded.crtc_id
+        && native.sequence == guarded.sequence
+        && native.timestamp_ns == guarded.timestamp_ns
+        && native.width == guarded.width
+        && native.height == guarded.height
+        && native.fourcc == guarded.fourcc
+        && native.modifier == guarded.modifier
+        && native.plane_count == guarded.plane_count
+        && native.pitches == guarded.pitches
+        && native.offsets == guarded.offsets;
+    if !same {
+        return Err(io::Error::from_raw_os_error(libc::EBUSY));
+    }
+    native.abi_version = guarded.abi_version;
+    native.flags = guarded.flags;
+    native.color = guarded.color;
+    native.hdr_metadata = guarded.hdr_metadata;
+    native.read_guards = std::mem::take(&mut guarded.dma_bufs);
+    Ok(native)
 }
 
 #[cfg(test)]
@@ -251,5 +300,66 @@ mod tests {
             .open(drm_node::DRM_MAJOR, 0)
             .expect("vibeshine_drm card0");
         let _ = card.export_frame(1);
+    }
+}
+
+#[cfg(all(test, feature = "driver-read-leases"))]
+mod guarded_native_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    fn frame(flags: u32, abi_version: u32) -> DriverFrame {
+        DriverFrame {
+            flags,
+            abi_version,
+            crtc_id: 75,
+            sequence: 100,
+            timestamp_ns: 200,
+            width: 3840,
+            height: 2160,
+            fourcc: u32::from_le_bytes(*b"AB30"),
+            modifier: 42,
+            plane_count: 1,
+            pitches: [15360, 0, 0, 0],
+            reserved_zero: true,
+            ..DriverFrame::default()
+        }
+    }
+    #[test]
+    fn native_exporter_and_guard_have_independent_owned_descriptors() {
+        let mut guard = frame(5, 2);
+        let mut native = frame(1, 1);
+        guard.color = 2;
+        guard.hdr_metadata = [7; 12];
+        guard.dma_bufs[0] = Some(std::fs::File::open("/dev/null").unwrap().into());
+        native.dma_bufs[0] = Some(std::fs::File::open("/dev/null").unwrap().into());
+        let native_fd = native.dma_bufs[0].as_ref().unwrap().as_raw_fd();
+        let guard_fd = guard.dma_bufs[0].as_ref().unwrap().as_raw_fd();
+        let paired = native_with_read_guards(guard, native).unwrap();
+        assert_ne!(native_fd, guard_fd);
+        assert_eq!(paired.dma_bufs[0].as_ref().unwrap().as_raw_fd(), native_fd);
+        assert_eq!(
+            paired.read_guards[0].as_ref().unwrap().as_raw_fd(),
+            guard_fd
+        );
+        assert_eq!(paired.color, 2);
+        assert_eq!(paired.hdr_metadata, [7; 12]);
+    }
+    #[test]
+    fn presentation_or_layout_changes_refuse_pairing() {
+        for field in 0..3 {
+            let guard = frame(5, 2);
+            let mut native = frame(1, 1);
+            match field {
+                0 => native.sequence += 1,
+                1 => native.modifier += 1,
+                _ => native.fourcc += 1,
+            }
+            assert_eq!(
+                native_with_read_guards(guard, native)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EBUSY)
+            );
+        }
     }
 }

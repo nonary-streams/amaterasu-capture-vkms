@@ -380,7 +380,7 @@ host SDK C layout assertions.
 
 ### Guarded HDR10 capture
 
-The `driver-read-leases` helper now uses protocol 3 and the additive
+The `driver-read-leases` helper now uses protocol 4 and the additive
 `GET_FRAME_COLOR` ioctl (frame ABI 2). Colour interpretation and static HDR
 metadata are latched with the completed scanout. Capture v1.9 exposes that
 metadata for the owned stream. RGB10 PQ/BT.2020 is preserved through the private

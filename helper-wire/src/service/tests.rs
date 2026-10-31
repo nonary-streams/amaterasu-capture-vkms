@@ -178,6 +178,9 @@ fn ready_frame(planes: u32, fenced: bool) -> DriverFrame {
     };
     for plane in 0..planes as usize {
         frame.dma_bufs[plane] = Some(pipe_end());
+        if cfg!(feature = "driver-read-leases") {
+            frame.read_guards[plane] = Some(pipe_end());
+        }
         frame.pitches[plane] = 7680;
         if fenced {
             frame.sync_files[plane] = Some(pipe_end());
@@ -304,11 +307,12 @@ fn a_ready_frame_sends_buffers_then_fences_with_admin_raised_only_for_the_ioctl(
     let mut service = opened(&fixture);
     let mut frame = ready_frame(2, false);
     frame.sync_files[1] = Some(pipe_end());
-    let expected_order = [
+    let mut expected_order = vec![
         frame.dma_bufs[0].as_ref().unwrap().as_raw_fd(),
         frame.dma_bufs[1].as_ref().unwrap().as_raw_fd(),
         frame.sync_files[1].as_ref().unwrap().as_raw_fd(),
     ];
+    expected_order.extend(frame.read_guards.iter().flatten().map(AsRawFd::as_raw_fd));
     *fixture.script.frame.borrow_mut() = Some(Ok(frame));
 
     let (record, descriptors) = send(&mut service, Request::Frame { crtc_id: 41 });
@@ -317,7 +321,14 @@ fn a_ready_frame_sends_buffers_then_fences_with_admin_raised_only_for_the_ioctl(
     };
     assert_eq!(descriptor.plane_count, 2);
     assert_eq!(descriptor.fence_mask, 0b10);
-    assert_eq!(descriptor.descriptor_count(), 3);
+    assert_eq!(
+        descriptor.descriptor_count(),
+        if cfg!(feature = "driver-read-leases") {
+            5
+        } else {
+            3
+        }
+    );
     let order: Vec<_> = descriptors.iter().map(AsRawFd::as_raw_fd).collect();
     assert_eq!(order, expected_order);
     assert_eq!(fixture.privilege.raises.get(), 1);

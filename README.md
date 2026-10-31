@@ -56,7 +56,7 @@ needs native qualification.
 ## Driver-backed GPU frame leases (experimental opt-in)
 
 Build **both** capture and helper with `driver-read-leases` only when testing a
-matching experimental driver. The direct export does not copy pixels. Helper protocol 2
+matching experimental driver. The direct export does not copy pixels. Helper protocol 4
 requests the additive
 `GET_FRAME_LEASED` ioctl from a matching driver. It exports read-only DMA-BUF
 wrappers for the completed scanout, retaining a driver read lease. Before any
@@ -97,3 +97,8 @@ Missing driver support, the wrong helper protocol, unavailable GPU snapshot
 support or an encoder without the lease interface fails explicitly. This does
 not eliminate stalls during a stuck GPU operation or establish forced-reboot
 safety for arbitrary retained direct imports.
+
+Protocol 4 carries native GPU DMA-BUFs and separate driver read guards. The
+helper verifies that both exports describe the same presentation. Consumers
+retain the guards through source GPU completion; snapshots then retain only
+their independent allocation. This preserves NVIDIA import compatibility.

@@ -57,6 +57,8 @@ pub struct HelperHello {
 pub struct ExportedFrame {
     pub descriptor: FrameDescriptor,
     pub dma_bufs: Vec<OwnedFd>,
+    /// Retain until all reads of the source allocation have completed.
+    pub read_guards: Vec<OwnedFd>,
     pub fences: [Option<OwnedFd>; MAX_PLANES],
 }
 
@@ -254,6 +256,7 @@ fn split_descriptors(descriptor: FrameDescriptor, descriptors: Vec<OwnedFd>) -> 
     ExportedFrame {
         descriptor,
         dma_bufs,
+        read_guards: descriptors.collect(),
         fences,
     }
 }

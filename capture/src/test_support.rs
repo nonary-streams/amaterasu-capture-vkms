@@ -152,11 +152,13 @@ impl SourceScript {
                 pitches,
                 offsets: [0; MAX_PLANES],
                 fence_mask: u32::from(fenced),
+                guard_count: 0,
 
                 color: 1,
                 hdr_metadata: [0; 12],
             },
             dma_bufs: vec![self.tracked_descriptor()],
+            read_guards: Vec::new(),
             fences,
         }
     }

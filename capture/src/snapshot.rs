@@ -114,6 +114,7 @@ mod platform {
             Ok(ExportedFrame {
                 descriptor,
                 dma_bufs: vec![owned.ok_or(MEDIA_BACKEND_ERROR)?],
+                read_guards: Vec::new(),
                 fences: Default::default(),
             })
         }
@@ -135,6 +136,7 @@ mod platform {
                 || descriptor.width > DMABUF_MAX_DIMENSION
                 || descriptor.height > DMABUF_MAX_DIMENSION
                 || exported.dma_bufs.len() != planes
+                || exported.read_guards.len() != descriptor.guard_count as usize
                 || exported
                     .fences
                     .iter()
@@ -179,6 +181,7 @@ mod platform {
             pitches: [output.pitch, 0, 0, 0],
             offsets: [0; MAX_PLANES],
             fence_mask: 0,
+            guard_count: 0,
             ..source
         };
         if !amaterasu_vkms_frame_helper::protocol::frame_descriptor_is_valid(&descriptor) {
@@ -261,6 +264,7 @@ mod platform {
                 pitches: [16, 0, 0, 0],
                 offsets: [0; MAX_PLANES],
                 fence_mask: 0,
+                guard_count: 0,
 
                 color: 1,
                 hdr_metadata: [0; 12],
@@ -374,6 +378,7 @@ mod platform {
             let exported = ExportedFrame {
                 descriptor: source(),
                 dma_bufs: vec![],
+                read_guards: Vec::new(),
                 fences: Default::default(),
             };
             assert!(Input::from_export(&exported).is_err());
@@ -390,6 +395,7 @@ mod platform {
             let exported = ExportedFrame {
                 descriptor: source(),
                 dma_bufs: vec![],
+                read_guards: Vec::new(),
                 fences: [Some(ready), Some(second), None, None],
             };
             assert!(wait_for_acquire(&exported, Duration::from_millis(10)).is_ok());
@@ -413,6 +419,7 @@ mod platform {
             let exported = ExportedFrame {
                 descriptor: source(),
                 dma_bufs: vec![],
+                read_guards: Vec::new(),
                 fences,
             };
             assert!(wait_for_acquire(&exported, Duration::from_millis(1)).is_err());

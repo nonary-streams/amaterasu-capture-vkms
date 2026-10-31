@@ -37,6 +37,7 @@ pub struct DriverFrame {
     pub modifier: u64,
     pub plane_count: u32,
     pub dma_bufs: [Option<OwnedFd>; MAX_PLANES],
+    pub read_guards: [Option<OwnedFd>; MAX_PLANES],
     pub pitches: [u32; MAX_PLANES],
     pub offsets: [u32; MAX_PLANES],
     pub sync_files: [Option<OwnedFd>; MAX_PLANES],
@@ -298,6 +299,7 @@ fn empty_frame_outcome(frame: DriverFrame) -> Outcome {
         && frame.plane_count == 0
         && frame.dma_bufs.iter().all(Option::is_none)
         && frame.sync_files.iter().all(Option::is_none)
+        && frame.read_guards.iter().all(Option::is_none)
         && frame.pitches == [0; MAX_PLANES]
         && frame.offsets == [0; MAX_PLANES];
     if !layout_empty {
@@ -312,8 +314,11 @@ fn empty_frame_outcome(frame: DriverFrame) -> Outcome {
 
 fn ready_frame_outcome(frame: DriverFrame) -> Outcome {
     let planes = (frame.plane_count as usize).min(MAX_PLANES + 1);
-    let inactive_planes_clear = (planes..MAX_PLANES)
-        .all(|plane| frame.dma_bufs[plane].is_none() && frame.sync_files[plane].is_none());
+    let inactive_planes_clear = (planes..MAX_PLANES).all(|plane| {
+        frame.dma_bufs[plane].is_none()
+            && frame.sync_files[plane].is_none()
+            && frame.read_guards[plane].is_none()
+    });
     let active_buffers_present = frame.dma_bufs.iter().take(planes).all(Option::is_some);
     let fence_mask = frame
         .sync_files
@@ -333,10 +338,17 @@ fn ready_frame_outcome(frame: DriverFrame) -> Outcome {
         pitches: frame.pitches,
         offsets: frame.offsets,
         fence_mask,
+        guard_count: frame.read_guards.iter().flatten().count() as u32,
         color: frame.color,
         hdr_metadata: frame.hdr_metadata,
     };
-    if !inactive_planes_clear
+    let guards_valid = if cfg!(feature = "driver-read-leases") {
+        frame.read_guards.iter().take(planes).all(Option::is_some)
+    } else {
+        frame.read_guards.iter().all(Option::is_none)
+    };
+    if !guards_valid
+        || !inactive_planes_clear
         || !active_buffers_present
         || !protocol::frame_descriptor_is_valid(&descriptor)
     {
@@ -345,10 +357,12 @@ fn ready_frame_outcome(frame: DriverFrame) -> Outcome {
     let DriverFrame {
         dma_bufs,
         sync_files,
+        read_guards,
         ..
     } = frame;
     let mut descriptors: Vec<OwnedFd> = dma_bufs.into_iter().flatten().collect();
     descriptors.extend(sync_files.into_iter().flatten());
+    descriptors.extend(read_guards.into_iter().flatten());
     Outcome {
         reply: Reply::FrameReady(descriptor),
         descriptors,
