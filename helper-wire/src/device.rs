@@ -1,9 +1,10 @@
-//! The two private vibeshine_drm presentation ioctls on a verified node.
+//! The private vibeshine_drm presentation and frame ioctls on a verified node.
 //!
 //! The helper never changes display state. Opening goes through
 //! `drm_node`, which never keeps DRM master.
 use crate::service::{
-    CardOpener, DRIVER_ABI_VERSION, DriverFrame, DriverPresentation, OpenFailure, PresentationCard,
+    CardOpener, DRIVER_ABI_VERSION, DRIVER_FRAME_ABI_VERSION, DriverFrame, DriverPresentation,
+    OpenFailure, PresentationCard,
 };
 use amaterasu_vkms_frame_helper::{
     drm_node::{
@@ -32,7 +33,7 @@ pub struct WaitPresentRecord {
     pub reserved: [u64; 2],
 }
 
-/// `struct vibeshine_drm_frame` from vibeshine_drm_uapi.h.
+/// `struct vibeshine_drm_frame` shared by the ordinary and leased export ioctls.
 #[repr(C)]
 #[derive(Default)]
 pub struct FrameRecord {
@@ -62,9 +63,16 @@ pub const VIBESHINE_IOCTL_WAIT_PRESENT: u32 = drm_ioctl(
     DRM_COMMAND_BASE,
     size_of::<WaitPresentRecord>(),
 );
+#[cfg(any(not(feature = "driver-read-leases"), test))]
 pub const VIBESHINE_IOCTL_GET_FRAME: u32 = drm_ioctl(
     IOC_READ | IOC_WRITE,
     DRM_COMMAND_BASE + 1,
+    size_of::<FrameRecord>(),
+);
+#[cfg(feature = "driver-read-leases")]
+pub const VIBESHINE_IOCTL_GET_FRAME_LEASED: u32 = drm_ioctl(
+    IOC_READ | IOC_WRITE,
+    DRM_COMMAND_BASE + 4,
     size_of::<FrameRecord>(),
 );
 
@@ -103,12 +111,16 @@ impl PresentationCard for VibeshineCard {
     fn export_frame(&self, crtc_id: u32) -> io::Result<DriverFrame> {
         // The driver requires every field except the version and CRTC to be zero.
         let mut record = FrameRecord {
-            abi_version: DRIVER_ABI_VERSION,
+            abi_version: DRIVER_FRAME_ABI_VERSION,
             crtc_id,
             ..FrameRecord::default()
         };
         // SAFETY: GET_FRAME takes one vibeshine_drm_frame that lives through the call.
-        unsafe { ioctl_record(&self.device, VIBESHINE_IOCTL_GET_FRAME, &mut record) }?;
+        #[cfg(feature = "driver-read-leases")]
+        let request = VIBESHINE_IOCTL_GET_FRAME_LEASED;
+        #[cfg(not(feature = "driver-read-leases"))]
+        let request = VIBESHINE_IOCTL_GET_FRAME;
+        unsafe { ioctl_record(&self.device, request, &mut record) }?;
         Ok(take_frame(record))
     }
 
@@ -163,7 +175,29 @@ fn take_frame(record: FrameRecord) -> DriverFrame {
         pitches: record.pitches,
         offsets: record.offsets,
         sync_files: record.sync_file_fds.map(own),
-        reserved_zero: record.reserved_u32 == 0 && record.reserved == [0; 4],
+        reserved_zero: if cfg!(feature = "driver-read-leases") {
+            record.reserved_u32 <= 2 && (record.reserved_u32 == 2 || record.reserved == [0; 4])
+        } else {
+            record.reserved_u32 == 0 && record.reserved == [0; 4]
+        },
+        color: if cfg!(feature = "driver-read-leases") {
+            record.reserved_u32
+        } else {
+            1
+        },
+        hdr_metadata: if cfg!(feature = "driver-read-leases") && record.reserved_u32 == 2 {
+            // Linux hdr_output_metadata is a u32 type followed by the HDMI
+            // infoframe (EOTF/type bytes, twelve u16 fields and padding).
+            let mut bytes = [0u8; 32];
+            for (word, value) in record.reserved.into_iter().enumerate() {
+                bytes[word * 8..word * 8 + 8].copy_from_slice(&value.to_ne_bytes());
+            }
+            std::array::from_fn(|index| {
+                u16::from_ne_bytes([bytes[6 + index * 2], bytes[7 + index * 2]])
+            })
+        } else {
+            [0; 12]
+        },
     }
 }
 
@@ -176,6 +210,8 @@ mod tests {
     fn private_ioctl_numbers_match_the_driver_header() {
         assert_eq!(VIBESHINE_IOCTL_WAIT_PRESENT, 0xC030_6440);
         assert_eq!(VIBESHINE_IOCTL_GET_FRAME, 0xC098_6441);
+        #[cfg(feature = "driver-read-leases")]
+        assert_eq!(VIBESHINE_IOCTL_GET_FRAME_LEASED, 0xC098_6444);
     }
 
     #[test]

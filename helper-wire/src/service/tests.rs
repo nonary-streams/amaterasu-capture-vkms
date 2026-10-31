@@ -162,11 +162,12 @@ fn opened(fixture: &Fixture) -> Service<&FakeOpener, &FakePrivilege> {
 
 fn ready_frame(planes: u32, fenced: bool) -> DriverFrame {
     let mut frame = DriverFrame {
-        abi_version: 1,
+        abi_version: DRIVER_FRAME_ABI_VERSION,
         crtc_id: 41,
         sequence: 12,
         timestamp_ns: 5_000,
         flags: DRIVER_FRAME_READY,
+        color: 1,
         width: 1920,
         height: 1080,
         fourcc: u32::from_le_bytes(*b"XR24"),
@@ -328,7 +329,7 @@ fn an_empty_presentation_is_reported_without_descriptors() {
     let fixture = Fixture::new(true);
     let mut service = opened(&fixture);
     *fixture.script.frame.borrow_mut() = Some(Ok(DriverFrame {
-        abi_version: 1,
+        abi_version: DRIVER_FRAME_ABI_VERSION,
         crtc_id: 41,
         flags: DRIVER_FRAME_EMPTY,
         reserved_zero: true,
@@ -345,7 +346,7 @@ fn an_empty_presentation_is_reported_without_descriptors() {
 #[test]
 fn malformed_driver_frames_close_every_descriptor() {
     let mutations: [fn(&mut DriverFrame, OwnedFd); 6] = [
-        |frame, _| frame.abi_version = 2,
+        |frame, _| frame.abi_version = DRIVER_FRAME_ABI_VERSION + 1,
         |frame, _| frame.crtc_id = 40,
         |frame, _| frame.reserved_zero = false,
         |frame, _| frame.flags = DRIVER_FRAME_READY | DRIVER_FRAME_EMPTY,
@@ -410,7 +411,7 @@ fn driver_errors_map_to_distinct_failures() {
 #[test]
 fn waits_validate_the_driver_echo() {
     let presentation = DriverPresentation {
-        abi_version: 1,
+        abi_version: DRIVER_ABI_VERSION,
         crtc_id: 41,
         sequence: 13,
         timestamp_ns: 9,
@@ -455,4 +456,19 @@ fn waits_validate_the_driver_echo() {
         let (record, _) = send(&mut service, wait);
         assert_eq!(failure_of(&record), Failure::InvalidDriverResponse);
     }
+}
+
+#[test]
+#[cfg(feature = "driver-read-leases")]
+fn unleased_driver_frame_is_rejected() {
+    let mut frame = ready_frame(1, false);
+    frame.flags = 1;
+    let outcome = frame_outcome(41, frame);
+    assert!(matches!(
+        outcome.reply,
+        Reply::Failure {
+            failure: Failure::InvalidDriverResponse,
+            ..
+        }
+    ));
 }

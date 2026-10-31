@@ -28,6 +28,9 @@ use std::{
 /// Longest single WAIT. It bounds how long a thread that cannot be
 /// interrupted takes to notice a stop or a fault.
 pub const PRESENT_WAIT_TIMEOUT_MS: u32 = 100;
+// Poll direct sources promptly after a reader requests a frame and to expire
+// unclaimed mailbox leases, without waiting for a blocked presentation.
+const DIRECT_WAIT_TIMEOUT_MS: u32 = 5;
 /// Pause after the driver reported `busy` or `interrupted`.
 const RETRY_DELAY: Duration = Duration::from_millis(5);
 /// Pause while the CRTC is gone and the controller re-resolves the output.
@@ -41,6 +44,10 @@ const MAX_CONSECUTIVE_DRIVER_ERRORS: u32 = 10;
 /// Exports presentations of one CRTC. The production source is a helper
 /// process; the thread owning it is the only caller.
 pub trait FrameSource: Send {
+    /// Source descriptors prevent producer retirement until their last release.
+    fn holds_producer(&self) -> bool {
+        false
+    }
     /// Blocks until the CRTC completes a presentation newer than
     /// `last_sequence`, or for at most `timeout_ms`.
     fn wait(
@@ -170,6 +177,7 @@ struct Presenter {
     sequence_base: u64,
     consecutive_driver_errors: u32,
     snapshotter: Option<Snapshotter>,
+    producer_held: bool,
 }
 
 impl Presenter {
@@ -179,7 +187,9 @@ impl Presenter {
         stop: Arc<AtomicBool>,
         snapshotter: Option<Snapshotter>,
     ) -> Self {
+        let producer_held = source.holds_producer();
         Self {
+            producer_held,
             crtc_id: frames.crtc_id(),
             source,
             frames,
@@ -210,17 +220,33 @@ impl Presenter {
     /// Waits for one newer presentation and stores it.
     fn step(&mut self) -> Next {
         self.follow_retarget();
-        let presentation =
-            match self
-                .source
-                .wait(self.crtc_id, self.driver_sequence, PRESENT_WAIT_TIMEOUT_MS)
-            {
-                Ok(presentation) => presentation,
-                Err(error) => return self.failed(&error),
-            };
-        if presentation.flags & PRESENT_CHANGED == 0 {
+        self.frames.expire_direct_frame(std::time::Instant::now());
+        let wait_ms = if self.producer_held && self.snapshotter.is_none() {
+            DIRECT_WAIT_TIMEOUT_MS
+        } else {
+            PRESENT_WAIT_TIMEOUT_MS
+        };
+        let presentation = match self
+            .source
+            .wait(self.crtc_id, self.driver_sequence, wait_ms)
+        {
+            Ok(presentation) => presentation,
+            Err(error) => return self.failed(&error),
+        };
+        let requested = self.producer_held && self.frames.take_capture_request();
+        if presentation.flags & PRESENT_CHANGED == 0 && !requested {
             // A timeout: nothing new was presented.
             self.consecutive_driver_errors = 0;
+            return Next::Continue;
+        }
+        // A direct driver lease blocks buffer retirement. Acquire it only when
+        // video asks for a frame, never while an encoder is still starting.
+        if self.producer_held && self.snapshotter.is_none() && !requested {
+            self.driver_sequence = self.driver_sequence.max(presentation.sequence);
+            self.frames.observe_presentation(
+                self.sequence_base.saturating_add(presentation.sequence),
+                presentation.timestamp_ns,
+            );
             return Next::Continue;
         }
         match self.source.frame(self.crtc_id) {
@@ -262,13 +288,16 @@ impl Presenter {
         let exported_sequence = exported.descriptor.sequence;
         let previous = self.driver_sequence;
         self.driver_sequence = previous.max(exported_sequence).max(waited_sequence);
-        if exported_sequence > previous {
+        if exported_sequence > previous || self.producer_held {
             let stream_sequence = self.sequence_base.saturating_add(exported_sequence);
             if let Some(snapshotter) = &mut self.snapshotter {
                 match snapshotter.snapshot(exported) {
                     Ok(snapshot) => self.frames.store_snapshot(snapshot, stream_sequence),
                     Err(_) => self.frames.set_fault(StreamFault::GpuSnapshotFailed),
                 }
+            } else if self.producer_held {
+                self.frames
+                    .store_leased(exported, stream_sequence, self.crtc_id);
             } else {
                 self.frames.store(exported, stream_sequence);
             }

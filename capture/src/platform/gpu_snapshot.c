@@ -178,6 +178,30 @@ static EGLImageKHR import_image(struct am_vkms_snapshotter *snapshotter,
                                     EGL_LINUX_DMA_BUF_EXT, NULL, attributes);
 }
 
+/* Some drivers expose AR30/XB30 but reject XR30. Try equivalent RGB layouts
+ * at the requested precision; never fall back from ten bits to eight bits. */
+static struct gbm_bo *allocate_snapshot(struct gbm_device *device,
+                                        uint32_t width, uint32_t height,
+                                        uint32_t *format) {
+    static const uint32_t rgb8[] = {GBM_FORMAT_XRGB8888, GBM_FORMAT_ARGB8888,
+                                    GBM_FORMAT_XBGR8888, GBM_FORMAT_ABGR8888};
+    static const uint32_t rgb10[] = {GBM_FORMAT_XRGB2101010, GBM_FORMAT_ARGB2101010,
+                                     GBM_FORMAT_XBGR2101010, GBM_FORMAT_ABGR2101010};
+    const uint32_t *formats = *format == GBM_FORMAT_XRGB2101010 ? rgb10 : rgb8;
+    for (unsigned i = 0; i < 4; ++i) {
+        struct gbm_bo *buffer = gbm_bo_create(device, width, height, formats[i],
+                                             GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
+        if (buffer == NULL)
+            buffer = gbm_bo_create(device, width, height, formats[i], GBM_BO_USE_RENDERING);
+        if (buffer != NULL && gbm_bo_get_plane_count(buffer) == 1) {
+            *format = formats[i];
+            return buffer;
+        }
+        if (buffer != NULL) gbm_bo_destroy(buffer);
+    }
+    return NULL;
+}
+
 int am_vkms_snapshot_copy(struct am_vkms_snapshotter *snapshotter,
                           const struct am_vkms_snapshot_input *input,
                           struct am_vkms_snapshot_output *output) {
@@ -220,11 +244,8 @@ int am_vkms_snapshot_copy(struct am_vkms_snapshotter *snapshotter,
     if (glGetError() != GL_NO_ERROR) return -2;
     EGLImageKHR source = import_image(snapshotter, input);
     if (source == EGL_NO_IMAGE_KHR) return -1;
-    struct gbm_bo *buffer = gbm_bo_create(snapshotter->gbm, input->width, input->height,
-                                         destination_format,
-                                         GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
-    if (buffer == NULL) buffer = gbm_bo_create(snapshotter->gbm, input->width, input->height,
-                                              destination_format, GBM_BO_USE_RENDERING);
+    struct gbm_bo *buffer = allocate_snapshot(snapshotter->gbm, input->width,
+                                              input->height, &destination_format);
     GLuint source_texture = 0, destination_texture = 0, framebuffer = 0;
     EGLImageKHR destination = EGL_NO_IMAGE_KHR;
     int result = -1;
@@ -264,7 +285,8 @@ int am_vkms_snapshot_copy(struct am_vkms_snapshotter *snapshotter,
     glGetIntegerv(GL_RED_BITS, &red_bits);
     glGetIntegerv(GL_GREEN_BITS, &green_bits);
     glGetIntegerv(GL_BLUE_BITS, &blue_bits);
-    GLint required_bits = destination_format == GBM_FORMAT_XRGB2101010 ? 10 : 8;
+    GLint required_bits = (input->fourcc == DRM_FORMAT_XRGB2101010 || input->fourcc == DRM_FORMAT_ARGB2101010 ||
+                           input->fourcc == DRM_FORMAT_XBGR2101010 || input->fourcc == DRM_FORMAT_ABGR2101010) ? 10 : 8;
     if (red_bits < required_bits || green_bits < required_bits || blue_bits < required_bits)
         goto cleanup;
     static const GLfloat positions[] = {-1,-1, 1,-1, -1,1, 1,1};

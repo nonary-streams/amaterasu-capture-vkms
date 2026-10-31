@@ -226,15 +226,29 @@ Build with `--features linux-kwin-geometry,linux-gpu-snapshot` and set
 development libraries, plus access to a compatible render node at runtime.
 The presentation thread waits for all input acquire fences, then renders into
 a fresh private GBM allocation and calls `glFinish` before exporting it. This
-provider never writes that allocation again. RGB8 input uses XR24 storage;
-XR30, AR30, XB30 and AB30 input uses XR30 storage, a high-precision sampler and
-a framebuffer with at least ten bits per RGB component. Unsupported import or
+provider never writes that allocation again. RGB8 input uses an available
+eight-bit RGB layout. XR30, AR30, XB30 and AB30 input uses an available ten-bit
+RGB layout, a high-precision sampler and a framebuffer with at least ten bits
+per RGB component. Unsupported import or
 render targets fail without reducing precision. No CPU readback occurs.
 
-`read_dmabuf_frame_leased` supports only these completed private snapshots.
-Ordinary mutable scanout exports return `MEDIA_UNSUPPORTED` from the leased
-read. Retaining pins immutable pixels and descriptors even after frame
-replacement or stream close. The consumer must retain the native binding until
+Set `require_lease:true` alongside `gpu_snapshot:true` and build both provider
+and helper with `driver-read-leases` to require a driver guard during the copy.
+The temporary source import is released after GPU completion; retained consumers
+own only the private snapshot. Set `require_frame_lease:true` in the video
+component as well to reject borrowed delivery and CPU fallback end to end.
+
+The default `gpu_snapshot:false` build advertises capture v1.5 and uses
+`WAIT_PRESENT` / `GET_FRAME` with the existing driver. It deliberately does not
+advertise v1.6 retained frames or v1.8 retained-resource negotiation.
+
+`read_dmabuf_frame_leased` also supports direct driver read leases without
+copying when **both** provider and helper are built with the experimental
+`driver-read-leases` feature. Only that opt-in mode requires the matching
+leased-export driver. Accepted direct frames
+leave the mailbox; retained encoder references keep their driver lease alive
+until GPU completion. Retaining pins pixels and descriptors even after stream
+close. The consumer must retain the native binding until
 it releases every frame. A global limit of eight retained references applies
 across frames, streams and stream restarts; a full limit returns `MEDIA_BUSY`
 and acquires nothing.
@@ -247,11 +261,12 @@ capacity slot until the process ends, preventing premature reuse. This bounded
 failure behavior can make later retains busy; the usual synchronous encoder
 path completes its read before release and uses `-1`.
 
-The context initializes on its presentation thread before open succeeds; missing
+When a private copy is requested, its context initializes on the presentation
+thread before open succeeds; missing
 snapshot support reports `gpu_snapshot_unavailable`. A failed copy during a
 stream faults it as `gpu_snapshot_failed`. Fresh allocation and synchronous GPU
 completion favor ownership correctness; sustained cost and multi-GPU import need
-hardware measurement. Ten-bit storage is not an HDR qualification: the current
+hardware measurement. Ten-bit storage is not an HDR qualification: the legacy
 KMS frame metadata remains sRGB, and HDR colorimetry, encoder support and client
 playback remain separate unfinished gates.
 
@@ -292,7 +307,7 @@ directory and its socket end at descriptor 3; every other descriptor is
 close-on-exec (Linux 5.11 or later). The helper exits when the socket closes,
 and exit statuses 64-69 identify startup refusals.
 
-Every record is one datagram of fixed length, little-endian, version 1. All
+Every record is one datagram of fixed length, little-endian, version 2. Version 2 requires driver-backed read leases for exported frames. All
 fields an operation does not use and every reserved byte must be zero;
 anything else, a wrong length, or a request carrying descriptors receives a
 `malformed_request` failure without touching the device.
@@ -352,3 +367,24 @@ fence behavior, presentation-to-availability latency and VRR cadence on real
 hardware, and the video and encoder import path remain separate acceptance
 gates. Behavior was modeled on Vibeshine's KMS capture; no Vibeshine
 source was copied.
+
+### Cursor limitation
+
+Only the primary plane is exported. A cursor rendered by the compositor into that plane is captured, but a separate hardware cursor plane is not composited and may be absent from the stream. The current driver export does not report whether a separate cursor plane is active, so the provider cannot detect this per frame. Hardware cursor composition remains unimplemented.
+
+The provider currently carries a local ABI bridge for the v1.7/v1.8 capture
+table tails while its independently built SDK dependency remains pinned to the
+released revision. The bridge must be replaced with the matching SDK definitions
+when that SDK revision is available; its 64-bit layout is checked against the
+host SDK C layout assertions.
+
+### Guarded HDR10 capture
+
+The `driver-read-leases` helper now uses protocol 3 and the additive
+`GET_FRAME_COLOR` ioctl (frame ABI 2). Colour interpretation and static HDR
+metadata are latched with the completed scanout. Capture v1.9 exposes that
+metadata for the owned stream. RGB10 PQ/BT.2020 is preserved through the private
+GPU snapshot; an unknown colour state or an eight-bit HDR source is refused.
+Older frame ioctls and helper protocol 1 retain their compatibility behavior.
+The corresponding driver and a 10-bit encoder are required; allocation alone
+is not an HDR qualification.

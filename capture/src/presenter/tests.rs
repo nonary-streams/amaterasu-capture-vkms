@@ -110,11 +110,11 @@ fn presentation_sequences_and_timestamps_never_decrease() {
 #[test]
 fn a_frame_newer_than_the_wait_coalesces_the_gap() {
     let run = running();
-    run.script.push_wait(ScriptedWait::Presented(3));
     run.script.push(Scripted::Frame {
         sequence: 5,
         timestamp_ns: EPOCH_NS,
     });
+    run.script.push_wait(ScriptedWait::Presented(3));
     assert!(run.reaches(5));
     assert!(run.waited_for(41, 5));
 }

@@ -3,7 +3,8 @@
 //! The driver exports mutable compositor storage. This adapter copies it into
 //! a fresh render-node allocation and waits for the GPU copy to complete. The
 //! exported allocation is never reused or written by this provider afterward.
-//! RGB8 remains eight-bit XR24 and RGB10 remains ten-bit XR30. Driver import or
+//! RGB8 remains eight-bit RGB and RGB10 remains ten-bit RGB, using an equivalent
+//! channel layout supported by the render node. Driver import or
 //! render-target refusal is unsupported, never an implicit precision downgrade.
 //! This storage contract does not establish HDR colorimetry or encoder support.
 use amaterasu_media::MEDIA_UNSUPPORTED;
@@ -163,10 +164,10 @@ mod platform {
         source: FrameDescriptor,
         output: &Output,
     ) -> Result<FrameDescriptor, Status> {
-        let expected_format = destination_format(source.fourcc).ok_or(MEDIA_UNSUPPORTED)?;
+        let source_precision = rgb_precision(source.fourcc).ok_or(MEDIA_UNSUPPORTED)?;
         if output.fd < 0
             || output.reserved != 0
-            || output.fourcc != expected_format
+            || rgb_precision(output.fourcc) != Some(source_precision)
             || output.pitch < source.width.checked_mul(4).ok_or(MEDIA_BACKEND_ERROR)?
         {
             return Err(MEDIA_BACKEND_ERROR);
@@ -186,19 +187,19 @@ mod platform {
         Ok(descriptor)
     }
 
-    fn destination_format(source: u32) -> Option<u32> {
+    fn rgb_precision(source: u32) -> Option<u32> {
         let rgb8 = [*b"XR24", *b"AR24", *b"XB24", *b"AB24"];
         let rgb10 = [*b"XR30", *b"AR30", *b"XB30", *b"AB30"];
         if rgb8
             .iter()
             .any(|format| u32::from_le_bytes(*format) == source)
         {
-            Some(u32::from_le_bytes(*b"XR24"))
+            Some(8)
         } else if rgb10
             .iter()
             .any(|format| u32::from_le_bytes(*format) == source)
         {
-            Some(u32::from_le_bytes(*b"XR30"))
+            Some(10)
         } else {
             None
         }
@@ -260,6 +261,9 @@ mod platform {
                 pitches: [16, 0, 0, 0],
                 offsets: [0; MAX_PLANES],
                 fence_mask: 0,
+
+                color: 1,
+                hdr_metadata: [0; 12],
             }
         }
 
@@ -341,7 +345,28 @@ mod platform {
                     assert!(copied_descriptor(source, &output).is_err());
                 }
             }
-            assert_eq!(destination_format(u32::from_le_bytes(*b"NV12")), None);
+            assert_eq!(rgb_precision(u32::from_le_bytes(*b"NV12")), None);
+        }
+
+        #[test]
+        fn equivalent_rgb10_layouts_are_accepted_without_precision_loss() {
+            let source = FrameDescriptor {
+                fourcc: u32::from_le_bytes(*b"XR30"),
+                ..source()
+            };
+            for format in [*b"XR30", *b"AR30", *b"XB30", *b"AB30"] {
+                let output = Output {
+                    fd: 8,
+                    pitch: 32,
+                    fourcc: u32::from_le_bytes(format),
+                    reserved: 0,
+                    modifier: 0,
+                };
+                assert_eq!(
+                    copied_descriptor(source, &output).unwrap().fourcc,
+                    output.fourcc
+                );
+            }
         }
 
         #[test]

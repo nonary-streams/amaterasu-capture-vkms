@@ -1,4 +1,4 @@
-//! Retained immutable snapshots. Ordinary scanout exports never enter this path.
+//! Retained immutable GPU frames, backed by driver read leases or private copies.
 use crate::frames::StoredFrame;
 use amaterasu_media::{DmaBufFrameLease, MEDIA_BUSY, MEDIA_UNSUPPORTED};
 use amaterasu_module_sdk::abi::{STATUS_OK, Status};
@@ -27,12 +27,12 @@ pub fn descriptor(stored: &Arc<StoredFrame>) -> Result<DmaBufFrameLease, Status>
     Ok(DmaBufFrameLease {
         frame: *stored.frame(),
         context: Arc::as_ptr(stored).cast_mut().cast(),
-        retain: Some(retain),
-        release: Some(release),
+        retain: Some(retain_resource),
+        release: Some(release_resource),
     })
 }
 
-unsafe extern "C" fn retain(context: *mut c_void) -> Status {
+pub(crate) unsafe extern "C" fn retain_resource(context: *mut c_void) -> Status {
     // SAFETY: context comes only from descriptor; the callback's borrowed
     // reference or an already retained reference keeps this allocation alive.
     let stored = unsafe { &*context.cast::<StoredFrame>() };
@@ -60,7 +60,7 @@ unsafe extern "C" fn retain(context: *mut c_void) -> Status {
     STATUS_OK
 }
 
-unsafe extern "C" fn release(context: *mut c_void, completion_fence_fd: i32) {
+pub(crate) unsafe extern "C" fn release_resource(context: *mut c_void, completion_fence_fd: i32) {
     // SAFETY: the caller consumes exactly one successful retain. The native
     // binding remains live until all retained references have been released.
     let stored = unsafe { Arc::from_raw(context.cast::<StoredFrame>()) };

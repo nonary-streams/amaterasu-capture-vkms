@@ -13,6 +13,9 @@ fn frame() -> FrameDescriptor {
         pitches: [7680, 3840, 0, 0],
         offsets: [0, 4096, 0, 0],
         fence_mask: 0b01,
+
+        color: 1,
+        hdr_metadata: [0; 12],
     }
 }
 
@@ -64,7 +67,7 @@ fn requests_with_wrong_length_magic_or_version_are_rejected() {
     assert_eq!(rejection.request_id, 0, "untrusted ids are not echoed");
 
     let mut version = bytes;
-    version[4] = 2;
+    version[4] = (PROTOCOL_VERSION + 1) as u8;
     let rejection = decode_request(&version).unwrap_err();
     assert_eq!(rejection.failure, Failure::UnsupportedVersion);
     assert_eq!(rejection.request_id, 9);

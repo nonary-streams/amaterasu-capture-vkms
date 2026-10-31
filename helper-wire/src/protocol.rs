@@ -8,11 +8,19 @@
 //! followed by the sync_file of each plane whose bit is set in `fence_mask`,
 //! also in plane order.
 
+/// Version 1 uses the released WAIT_PRESENT / GET_FRAME interface.
+/// The opt-in version 2 requires driver-backed source read leases for FRAME.
+#[cfg(not(feature = "driver-read-leases"))]
 pub const PROTOCOL_VERSION: u16 = 1;
+#[cfg(feature = "driver-read-leases")]
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const REQUEST_MAGIC: u32 = u32::from_le_bytes(*b"AVFQ");
 pub const RESPONSE_MAGIC: u32 = u32::from_le_bytes(*b"AVFR");
 pub const REQUEST_LEN: usize = 48;
+#[cfg(not(feature = "driver-read-leases"))]
 pub const RESPONSE_LEN: usize = 128;
+#[cfg(feature = "driver-read-leases")]
+pub const RESPONSE_LEN: usize = 160;
 pub const MAX_PLANES: usize = 4;
 /// One DMA-BUF and at most one sync_file per plane.
 pub const MAX_RESPONSE_DESCRIPTORS: usize = MAX_PLANES * 2;
@@ -174,6 +182,10 @@ pub struct FrameDescriptor {
     pub offsets: [u32; MAX_PLANES],
     /// Bit `i` set when plane `i` has an acquire sync_file.
     pub fence_mask: u32,
+    /// 0 unknown, 1 sRGB, 2 BT.2020/PQ; never inferred from bit depth.
+    pub color: u32,
+    /// RGB xy, white xy, maximum/minimum luminance, MaxCLL and MaxFALL.
+    pub hdr_metadata: [u16; 12],
 }
 
 impl FrameDescriptor {
@@ -198,7 +210,9 @@ impl FrameDescriptor {
             && self.width != 0
             && self.height != 0
             && self.fourcc != 0
-            && self.fence_mask & !used_mask == 0;
+            && self.fence_mask & !used_mask == 0
+            && self.color <= 2
+            && (self.color == 2 || self.hdr_metadata == [0; 12]);
         if !shape_valid {
             return Err(());
         }
@@ -318,7 +332,13 @@ mod response_layout {
     pub const MODIFIER: usize = 64;
     pub const PITCHES: usize = 72;
     pub const OFFSETS: usize = 88;
+    pub const COLOR: usize = 104;
+    #[cfg(feature = "driver-read-leases")]
+    pub const HDR: usize = 108;
+    #[cfg(not(feature = "driver-read-leases"))]
     pub const RESERVED: std::ops::Range<usize> = 104..super::RESPONSE_LEN;
+    #[cfg(feature = "driver-read-leases")]
+    pub const RESERVED: std::ops::Range<usize> = 132..super::RESPONSE_LEN;
     /// Everything after the common header; used to check unused body fields.
     pub const BODY: std::ops::Range<usize> = RESULT_FLAGS..super::RESPONSE_LEN;
 }
@@ -439,6 +459,13 @@ pub fn encode_response(record: &ResponseRecord) -> [u8; RESPONSE_LEN] {
             writer.u32(FOURCC, frame.fourcc);
             writer.u32(FENCE_MASK, frame.fence_mask);
             writer.u64(MODIFIER, frame.modifier);
+            #[cfg(feature = "driver-read-leases")]
+            {
+                writer.u32(COLOR, frame.color);
+                for (index, value) in frame.hdr_metadata.into_iter().enumerate() {
+                    writer.u16(HDR + index * 2, value);
+                }
+            }
             for plane in 0..MAX_PLANES {
                 writer.u32(PITCHES + plane * 4, frame.pitches[plane]);
                 writer.u32(OFFSETS + plane * 4, frame.offsets[plane]);
@@ -538,10 +565,20 @@ fn decode_success(reader: &RecordReader<'_>, opcode: Opcode) -> Result<Reply, Ma
                 pitches: [0; MAX_PLANES],
                 offsets: [0; MAX_PLANES],
                 fence_mask: reader.u32(FENCE_MASK),
+                color: if cfg!(feature = "driver-read-leases") {
+                    reader.u32(COLOR)
+                } else {
+                    1
+                },
+                hdr_metadata: [0; 12],
             };
             for plane in 0..MAX_PLANES {
                 frame.pitches[plane] = reader.u32(PITCHES + plane * 4);
                 frame.offsets[plane] = reader.u32(OFFSETS + plane * 4);
+            }
+            #[cfg(feature = "driver-read-leases")]
+            for (index, value) in frame.hdr_metadata.iter_mut().enumerate() {
+                *value = reader.u16(HDR + index * 2);
             }
             frame.validate().map_err(|()| MalformedResponse)?;
             Ok(Reply::FrameReady(frame))

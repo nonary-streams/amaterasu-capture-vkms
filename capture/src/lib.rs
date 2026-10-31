@@ -2,8 +2,10 @@
 //!
 //! Frames are the driver's completed primary-plane scanouts, exported as
 //! DMA-BUFs by the separately installed `amaterasu-vkms-frame-helper`, which
-//! alone holds CAP_SYS_ADMIN. Optional private GPU copies support immutable
-//! frame leases. This module never holds that capability.
+//! alone holds CAP_SYS_ADMIN. The default path lends ordinary scanout descriptors
+//! through capture v1.5. Optional private copies support retained frames; experimental
+//! driver read leases require an explicit matching build feature. This
+//! module never holds that capability.
 //! Native modules are trusted code; runtime API grants are not a native-code
 //! sandbox. The provider exists only on Linux.
 #![cfg(target_os = "linux")]

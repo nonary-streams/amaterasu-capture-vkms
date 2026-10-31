@@ -10,6 +10,14 @@ use std::{io, os::fd::OwnedFd};
 
 /// Driver ABI version of both private ioctls.
 pub const DRIVER_ABI_VERSION: u32 = 1;
+pub const DRIVER_FRAME_ABI_VERSION: u32 = if cfg!(feature = "driver-read-leases") {
+    2
+} else {
+    1
+};
+#[cfg(feature = "driver-read-leases")]
+const DRIVER_FRAME_READY: u32 = (1 << 0) | (1 << 2);
+#[cfg(not(feature = "driver-read-leases"))]
 const DRIVER_FRAME_READY: u32 = 1 << 0;
 const DRIVER_FRAME_EMPTY: u32 = 1 << 1;
 
@@ -33,6 +41,8 @@ pub struct DriverFrame {
     pub offsets: [u32; MAX_PLANES],
     pub sync_files: [Option<OwnedFd>; MAX_PLANES],
     pub reserved_zero: bool,
+    pub color: u32,
+    pub hdr_metadata: [u16; 12],
 }
 
 /// Answer of the driver's presentation wait ioctl after it succeeded.
@@ -202,10 +212,13 @@ impl<O: CardOpener, P: Privilege> Service<O, P> {
     fn export_frame(&self, crtc_id: u32) -> Outcome {
         let card = match self.privileged_card() {
             Ok(card) => card,
-            Err(outcome) => return outcome,
+            Err(failure) => return Outcome::failure(failure, 0),
         };
         match self.privilege.with_admin(|| card.export_frame(crtc_id)) {
             None => Outcome::failure(Failure::PermissionDenied, 0),
+            Some(Err(error)) if error.raw_os_error() == Some(libc::ENOTTY) => {
+                Outcome::failure(Failure::UnsupportedVersion, libc::ENOTTY)
+            }
             Some(Err(error)) => driver_failure(&error),
             Some(Ok(frame)) => frame_outcome(crtc_id, frame),
         }
@@ -214,7 +227,7 @@ impl<O: CardOpener, P: Privilege> Service<O, P> {
     fn wait_present(&self, crtc_id: u32, last_sequence: u64, timeout_ms: u32) -> Outcome {
         let card = match self.privileged_card() {
             Ok(card) => card,
-            Err(outcome) => return outcome,
+            Err(failure) => return Outcome::failure(failure, 0),
         };
         let waited = self
             .privilege
@@ -228,13 +241,10 @@ impl<O: CardOpener, P: Privilege> Service<O, P> {
 
     /// The open card, provided CAP_SYS_ADMIN is permitted at all. Checking
     /// permission first gives the module a stable "run setcap" answer.
-    fn privileged_card(&self) -> Result<&O::Card, Outcome> {
-        let card = self
-            .card
-            .as_ref()
-            .ok_or_else(|| Outcome::failure(Failure::CardNotOpen, 0))?;
+    fn privileged_card(&self) -> Result<&O::Card, Failure> {
+        let card = self.card.as_ref().ok_or(Failure::CardNotOpen)?;
         if !self.privilege.admin_permitted() {
-            return Err(Outcome::failure(Failure::PermissionDenied, 0));
+            return Err(Failure::PermissionDenied);
         }
         Ok(&card.card)
     }
@@ -267,8 +277,9 @@ fn driver_failure(error: &io::Error) -> Outcome {
 }
 
 fn frame_outcome(crtc_id: u32, frame: DriverFrame) -> Outcome {
-    let common_valid =
-        frame.abi_version == DRIVER_ABI_VERSION && frame.crtc_id == crtc_id && frame.reserved_zero;
+    let common_valid = frame.abi_version == DRIVER_FRAME_ABI_VERSION
+        && frame.crtc_id == crtc_id
+        && frame.reserved_zero;
     if !common_valid {
         return Outcome::failure(Failure::InvalidDriverResponse, 0);
     }
@@ -322,6 +333,8 @@ fn ready_frame_outcome(frame: DriverFrame) -> Outcome {
         pitches: frame.pitches,
         offsets: frame.offsets,
         fence_mask,
+        color: frame.color,
+        hdr_metadata: frame.hdr_metadata,
     };
     if !inactive_planes_clear
         || !active_buffers_present

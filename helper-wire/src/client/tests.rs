@@ -68,6 +68,8 @@ fn descriptor(plane_count: u32, fence_mask: u32) -> FrameDescriptor {
         pitches,
         offsets: [0; MAX_PLANES],
         fence_mask,
+        color: 1,
+        hdr_metadata: [0; 12],
     }
 }
 

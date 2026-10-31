@@ -8,6 +8,8 @@ rust-version = "1.89"
 crate-type = ["cdylib", "rlib"]
 
 [features]
+# Opt-in only: requires the experimental leased-export driver and helper.
+driver-read-leases = ["amaterasu-vkms-frame-helper/driver-read-leases"]
 # Desktop geometry from the compositor's wl_output/xdg-output layout. Needs
 # wayland-client development files and wayland-scanner at build time.
 linux-kwin-geometry = []

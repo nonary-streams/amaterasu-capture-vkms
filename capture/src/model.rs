@@ -65,10 +65,19 @@ pub struct Settings {
     pub authority_channel_fd: Option<i32>,
     /// Copies scanout into independent GPU storage before advertising leases.
     pub gpu_snapshot: bool,
+    /// Require immutable leases backed by a protected GPU snapshot. Never lend
+    /// the ordinary borrowed-frame interface in this mode.
+    pub require_lease: bool,
 }
 
 impl Settings {
     pub fn validate(&self) -> CaptureResult<()> {
+        if self.require_lease && (!self.gpu_snapshot || !cfg!(feature = "driver-read-leases")) {
+            return Err(CaptureError::new(
+                "lease_source_unavailable",
+                "require_lease needs gpu_snapshot and a driver-read-leases build",
+            ));
+        }
         let helper_valid = self
             .frame_helper
             .as_ref()
@@ -173,6 +182,20 @@ pub fn new_id() -> CaptureResult<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_leases_need_both_a_snapshot_and_a_guarded_source() {
+        let mut settings = Settings {
+            require_lease: true,
+            ..Settings::default()
+        };
+        assert!(settings.validate().is_err());
+        settings.gpu_snapshot = true;
+        assert_eq!(
+            settings.validate().is_ok(),
+            cfg!(feature = "driver-read-leases")
+        );
+    }
 
     #[test]
     fn settings_reject_unknown_fields_and_bad_values() {

@@ -106,6 +106,14 @@ pub struct Controller<B: Backend> {
 }
 
 impl<B: Backend> Controller<B> {
+    pub fn supports_retained_frames(&self) -> bool {
+        self.settings.gpu_snapshot || cfg!(feature = "driver-read-leases")
+    }
+
+    pub fn requires_lease(&self) -> bool {
+        self.settings.require_lease
+    }
+
     pub fn new(backend: B, settings: Settings) -> Self {
         Self {
             backend,
@@ -403,6 +411,10 @@ impl<B: Backend> Controller<B> {
             .map(|(id, stream)| {
                 let mut reply = stream_reply(*id, stream);
                 reply["frames_delivered"] = json!(stream.frames.delivered());
+                if let Some((color, metadata)) = stream.frames.color_status() {
+                    reply["color"] = json!(color);
+                    reply["hdr_metadata"] = json!(metadata);
+                }
                 reply["fault"] = json!(stream.frames.fault().map(StreamFault::code));
                 reply
             })
@@ -414,6 +426,15 @@ impl<B: Backend> Controller<B> {
             "frame_helper_configured": self.settings.frame_helper.is_some() || self.settings.authority_channel,
             "authority_mode": if self.settings.authority_channel { "package_approved" } else { "legacy_helper" },
             "gpu_snapshot": self.settings.gpu_snapshot,
+            "frame_delivery": if self.settings.gpu_snapshot {
+                "gpu_snapshot"
+            } else if cfg!(feature = "driver-read-leases") {
+                "driver_read_lease"
+            } else {
+                "borrowed_dmabuf"
+            },
+            "driver_read_leases": cfg!(feature = "driver-read-leases"),
+            "require_lease": self.settings.require_lease,
             "availability": self.last_availability.as_ref().map(Availability::json),
             "streams": streams,
             "opened": self.opened,

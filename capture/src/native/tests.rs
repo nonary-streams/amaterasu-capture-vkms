@@ -1,18 +1,29 @@
+use super::sdk_resource::CaptureApiV1_8;
 use super::*;
 use crate::{
     model::Operation,
     test_support::{FakeBackend, SourceScript, eventually, settings},
 };
 use amaterasu_media::{
-    CAPTURE_API_V1_4_SIZE, CAPTURE_DMABUF_INTERFACE_MINOR, CAPTURE_FRAME_CACHED_REUSE,
-    CAPTURE_FRAME_FRESH, CaptureApiV1_4, CpuFrame, DmaBufFrame, MEDIA_PENDING,
+    CAPTURE_API_V1_4_SIZE, CAPTURE_API_V1_6_SIZE, CAPTURE_DMABUF_INTERFACE_MINOR,
+    CAPTURE_FRAME_CACHED_REUSE, CAPTURE_FRAME_FRESH, CaptureApiV1_4, CpuFrame, DmaBufFrame,
+    MEDIA_PENDING,
 };
 
 struct TestBinding(*const CaptureApiV1_6);
 
 impl TestBinding {
     fn bind(factory: &Factory<FakeBackend>, caller: &[u8], min_minor: u32) -> Result<Self, Status> {
-        Self::bind_sized(factory, caller, min_minor, CAPTURE_API_V1_6_SIZE)
+        Self::bind_sized(
+            factory,
+            caller,
+            min_minor,
+            if min_minor <= 5 {
+                CAPTURE_API_V1_5_SIZE
+            } else {
+                CAPTURE_API_V1_6_SIZE
+            },
+        )
     }
 
     fn bind_sized(
@@ -136,24 +147,64 @@ fn setup() -> (Box<Factory<FakeBackend>>, Arc<SourceScript>, u64) {
 }
 
 #[test]
-fn the_table_advertises_v1_6_and_rejects_newer_queries() {
+fn the_table_advertises_only_the_configured_frame_lifetime() {
     let (factory, _, _) = setup();
     let binding = TestBinding::bind(&factory, b"amaterasu.video", 5).unwrap();
     let header = binding.api().base.header;
-    assert_eq!(header.minor, CAPTURE_LEASE_INTERFACE_MINOR);
-    assert_eq!(header.size, CAPTURE_API_V1_6_SIZE);
+    let expected = capture_header(cfg!(feature = "driver-read-leases"));
+    assert_eq!(header.minor, expected.minor);
+    assert_eq!(header.size, expected.size);
+    if !cfg!(feature = "driver-read-leases") {
+        assert_eq!(
+            TestBinding::bind(&factory, b"amaterasu.video", 6).err(),
+            Some(MEDIA_UNSUPPORTED)
+        );
+        assert_eq!(
+            TestBinding::bind_sized(&factory, b"amaterasu.video", 5, CAPTURE_API_V1_6_SIZE).err(),
+            Some(MEDIA_UNSUPPORTED)
+        );
+    }
     assert_eq!(
-        TestBinding::bind(&factory, b"amaterasu.video", 7).err(),
+        TestBinding::bind(&factory, b"amaterasu.video", 10).err(),
         Some(MEDIA_UNSUPPORTED)
     );
     assert_eq!(
-        TestBinding::bind_sized(&factory, b"amaterasu.video", 5, CAPTURE_API_V1_6_SIZE + 8).err(),
+        TestBinding::bind_sized(
+            &factory,
+            b"amaterasu.video",
+            5,
+            size_of::<CaptureApiV1_9>() as u32 + 8
+        )
+        .err(),
         Some(MEDIA_UNSUPPORTED)
     );
     assert_eq!(
         TestBinding::bind(&factory, b"", 4).err(),
         Some(STATUS_INVALID_ARGUMENT)
     );
+}
+
+#[test]
+fn required_leases_cannot_fall_back_to_a_borrowed_frame() {
+    let (mut factory, script, id) = setup();
+    factory.header = capture_header(true);
+    factory.require_lease = true;
+    let binding = TestBinding::bind(&factory, b"amaterasu.video", 5).unwrap();
+    let frames = factory
+        .controller
+        .lock()
+        .unwrap()
+        .reader("amaterasu.video", id)
+        .unwrap()
+        .frames;
+    frames.store_snapshot(script.export(1, 0, false), 1);
+    let mut sink = Sink {
+        status: STATUS_OK,
+        deliveries: Vec::new(),
+        script,
+    };
+    assert_eq!(binding.read(id, &mut sink), MEDIA_UNSUPPORTED);
+    assert!(sink.deliveries.is_empty());
 }
 
 #[test]
@@ -416,7 +467,9 @@ fn a_busy_controller_is_media_busy() {
 #[test]
 fn immutable_native_read_rejects_mutable_scanout_and_retains_private_snapshot() {
     let _serial = crate::leases::TEST_LEASE_CALLBACKS.lock().unwrap();
-    let (factory, script, id) = setup();
+    let (mut factory, script, id) = setup();
+    // These tests inject private snapshots rather than starting a GPU backend.
+    factory.header = capture_header(true);
     let binding = TestBinding::bind(&factory, b"amaterasu.video", 6).unwrap();
     let frames = factory
         .controller
@@ -472,4 +525,140 @@ fn immutable_native_read_rejects_mutable_scanout_and_retains_private_snapshot() 
     // SAFETY: consumes the one retained reference while binding remains live.
     unsafe { lease.release.unwrap()(lease.context, -1) };
     assert!(script.all_lent_descriptors_closed());
+}
+
+#[test]
+fn resource_negotiation_and_retained_dmabuf_follow_frame_lifetime() {
+    use super::sdk_resource::{
+        CaptureResourceFrame, CaptureResourceFrameSink, CaptureResourceOffer,
+        CaptureResourceOfferSink, DmaBufResourceCapabilities, FRAME_RESOURCE_DMABUF,
+        FRAME_SYNC_NONE, FrameDescriptor,
+    };
+    let _serial = crate::leases::TEST_LEASE_CALLBACKS.lock().unwrap();
+    let (mut factory, script, id) = setup();
+    // These tests inject private snapshots rather than starting a GPU backend.
+    factory.header = capture_header(true);
+    let binding = TestBinding::bind(&factory, b"amaterasu.video", 8).unwrap();
+    let api = unsafe { &*binding.0.cast::<CaptureApiV1_8>() };
+    let frames = factory
+        .controller
+        .lock()
+        .unwrap()
+        .reader("amaterasu.video", id)
+        .unwrap()
+        .frames;
+    frames.store_snapshot(script.export(11, 11_000, false), 11);
+    unsafe extern "C" fn offer(_: *mut c_void, offer: *const CaptureResourceOffer) -> Status {
+        let offer = unsafe { &*offer };
+        assert_eq!(offer.resource.kind, FRAME_RESOURCE_DMABUF);
+        assert_eq!(
+            offer.ownership,
+            super::sdk_resource::FRAME_OWNERSHIP_RETAINABLE
+        );
+        let capability = unsafe { &*offer.resource.data.cast::<DmaBufResourceCapabilities>() };
+        assert_ne!(capability.fourcc, 0);
+        STATUS_OK
+    }
+    let mut generation = 0;
+    let sink = CaptureResourceOfferSink {
+        context: std::ptr::null_mut(),
+        write: offer,
+    };
+    let context = api.base.base.base.context;
+    assert_eq!(
+        unsafe { (api.enumerate_resources)(context, id, sink, &mut generation) },
+        STATUS_OK
+    );
+    assert_eq!(
+        unsafe { (api.select_resource)(context, id, generation + 1, 1) },
+        MEDIA_UNSUPPORTED
+    );
+    let mut changed = script.export(12, 12_000, false);
+    changed.descriptor.width += 1;
+    frames.store_snapshot(changed, 12);
+    assert_eq!(
+        unsafe { (api.select_resource)(context, id, generation, 1) },
+        MEDIA_UNSUPPORTED
+    );
+    assert_eq!(
+        unsafe { (api.enumerate_resources)(context, id, sink, &mut generation) },
+        STATUS_OK
+    );
+    assert_eq!(generation, 2);
+    assert_eq!(
+        unsafe { (api.select_resource)(context, id, generation, 1) },
+        STATUS_OK
+    );
+    unsafe extern "C" fn frame(context: *mut c_void, value: *const CaptureResourceFrame) -> Status {
+        let value = unsafe { &*value };
+        assert_eq!(value.resource.kind, FRAME_RESOURCE_DMABUF);
+        assert_eq!(unsafe { (value.retain)(value.context) }, STATUS_OK);
+        unsafe { *context.cast::<Option<CaptureResourceFrame>>() = Some(*value) };
+        STATUS_OK
+    }
+    let mut retained: Option<CaptureResourceFrame> = None;
+    let sink = CaptureResourceFrameSink {
+        context: (&mut retained as *mut Option<CaptureResourceFrame>).cast(),
+        write: frame,
+    };
+    assert_eq!(
+        unsafe { (api.read_resource_frame)(context, id, sink) },
+        STATUS_OK
+    );
+    frames.store_snapshot(script.export(12, 12_000, false), 12);
+    assert_eq!(script.open_descriptors(), 2);
+    let retained = retained.unwrap();
+    let done = FrameDescriptor {
+        kind: FRAME_SYNC_NONE,
+        version: 0,
+        size: 0,
+        reserved: 0,
+        namespace: [0; 16],
+        data: std::ptr::null(),
+    };
+    unsafe { (retained.release)(retained.context, &done) };
+    assert_eq!(script.open_descriptors(), 1);
+}
+
+#[test]
+fn hdr_tail_tracks_the_completed_snapshot_and_preserves_old_bindings() {
+    let (mut factory, script, id) = setup();
+    factory.header = capture_header(true);
+    let binding = TestBinding::bind_sized(
+        &factory,
+        b"amaterasu.video",
+        9,
+        size_of::<CaptureApiV1_9>() as u32,
+    )
+    .unwrap();
+    let frames = factory
+        .controller
+        .lock()
+        .unwrap()
+        .reader("amaterasu.video", id)
+        .unwrap()
+        .frames;
+    let mut source = script.export(1, 1000, false);
+    source.descriptor.color = 2;
+    source.descriptor.fourcc = u32::from_le_bytes(*b"AR30");
+    source.descriptor.hdr_metadata = [
+        34000, 16000, 13250, 34500, 7500, 3000, 15635, 16450, 1000, 1, 1000, 400,
+    ];
+    frames.store_snapshot(source, 1);
+    let api = unsafe { &*binding.0.cast::<CaptureApiV1_9>() };
+    let mut metadata = HdrMetadata::default();
+    // SAFETY: the binding, stream and aligned writable metadata live for the call.
+    assert_eq!(
+        unsafe { (api.hdr_metadata)(api.base.base.base.context, id, &mut metadata) },
+        STATUS_OK
+    );
+    assert_eq!(metadata.enabled, 1);
+    assert_eq!(metadata.fields[8], 1000);
+    frames.store_snapshot(script.export(2, 2000, false), 2);
+    assert_eq!(
+        unsafe { (api.hdr_metadata)(api.base.base.base.context, id, &mut metadata) },
+        STATUS_OK
+    );
+    assert_eq!(metadata.enabled, 0);
+    assert_eq!(metadata.fields, [0; 12]);
 }

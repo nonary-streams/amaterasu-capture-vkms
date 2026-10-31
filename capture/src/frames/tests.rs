@@ -181,3 +181,27 @@ fn resolve_requests_are_taken_once() {
     assert!(frames.take_resolve_request());
     assert!(!frames.take_resolve_request());
 }
+
+#[test]
+fn producer_lease_is_consumed_only_after_acceptance_and_retention_controls_release() {
+    let _serial = crate::leases::TEST_LEASE_CALLBACKS.lock().unwrap();
+    let frames = StreamFrames::new(41, 0);
+    let source = SourceScript::default();
+    frames.store_leased(source.export(7, 7000, false), 7, 41);
+    let lent = frames.lend().unwrap();
+    assert!(lent.lease().is_ok());
+    assert_eq!(frames.finish(lent, MEDIA_BUSY), MEDIA_BUSY);
+    assert_eq!(source.open_descriptors(), 1);
+
+    let lent = frames.lend().unwrap();
+    let lease = lent.lease().unwrap();
+    // SAFETY: the lent frame owns the callback context until finish; retain
+    // adds the reference representing an asynchronous encoder GPU read.
+    assert_eq!(unsafe { lease.retain.unwrap()(lease.context) }, STATUS_OK);
+    frames.finish(lent, STATUS_OK);
+    assert!(matches!(frames.lend(), Err(MEDIA_PENDING)));
+    assert_eq!(source.open_descriptors(), 1);
+    // SAFETY: simulates a completed GPU read, consuming exactly one retain.
+    unsafe { lease.release.unwrap()(lease.context, -1) };
+    assert!(source.all_lent_descriptors_closed());
+}

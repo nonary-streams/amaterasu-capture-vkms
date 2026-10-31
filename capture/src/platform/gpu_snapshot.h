@@ -30,8 +30,8 @@ _Static_assert(sizeof(struct am_vkms_snapshot_output) == 24, "snapshot output AB
 /* All calls and destruction must happen on the thread that created the object.
  * Inputs remain borrowed through copy. Success returns one owned DMA-BUF fd:
  * the GPU copy is complete and this allocation is never written again.
- * RGB8 sources retain 8-bit storage (XR24), and RGB10 sources retain 10-bit
- * storage (XR30). Unsupported import/render formats fail, with no downgrade. */
+ * RGB8 sources retain 8-bit storage, and RGB10 sources retain 10-bit
+ * storage in an equivalent supported RGB layout. Unsupported import/render formats fail, with no downgrade. */
 struct am_vkms_snapshotter *am_vkms_snapshot_create(void);
 int am_vkms_snapshot_copy(struct am_vkms_snapshotter *,
                           const struct am_vkms_snapshot_input *,

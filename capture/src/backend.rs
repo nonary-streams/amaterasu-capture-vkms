@@ -97,6 +97,7 @@ impl Backend for NativeBackend {
             })?;
         match process.client().frame(binding.crtc_id) {
             Ok(_) => {}
+            Err(error) if error.failure() == Some(Failure::Busy) => {}
             Err(error) => {
                 return Err(match helper {
                     HelperEndpoint::ApprovedChannel(_)
@@ -144,6 +145,9 @@ struct HelperSource {
 }
 
 impl FrameSource for HelperSource {
+    fn holds_producer(&self) -> bool {
+        cfg!(feature = "driver-read-leases")
+    }
     fn wait(
         &mut self,
         crtc_id: u32,
