@@ -7,7 +7,9 @@ use super::sdk_resource::{
     FRAME_TRANSFER_SRGB, FrameClockMetadata, FrameColorMetadata, FrameDescriptor, FrameSyncFile,
 };
 use super::*;
+use crate::frames::StoredFrame;
 use amaterasu_media::{DmaBufFrame, MEDIA_PENDING};
+use std::{cell::Cell, sync::Arc};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Format {
@@ -59,6 +61,23 @@ fn sync_file() -> FrameDescriptor {
     descriptor(FRAME_SYNC_SYNC_FILE, 1, 0, std::ptr::null())
 }
 
+/// Pins both the adjusted resource descriptor and its original GPU storage.
+/// Retain/release are module-thread operations, as in the public frame ABI.
+struct ResourceLease {
+    frame: DmaBufFrame,
+    source_context: *mut c_void,
+    borrowed_source: Option<Arc<StoredFrame>>,
+    references: Cell<usize>,
+}
+unsafe fn drop_reference(context: *mut c_void) {
+    // SAFETY: a borrowed sentinel or successful retain keeps this box live.
+    let lease = unsafe { &*context.cast::<ResourceLease>() };
+    let remaining = lease.references.get() - 1;
+    lease.references.set(remaining);
+    if remaining == 0 {
+        drop(unsafe { Box::from_raw(context.cast::<ResourceLease>()) });
+    }
+}
 pub(super) unsafe extern "C" fn enumerate<B: Backend>(
     context: *mut c_void,
     stream: u64,
@@ -179,7 +198,14 @@ pub(super) unsafe extern "C" fn select<B: Backend>(
 
 unsafe extern "C" fn retain(context: *mut c_void) -> Status {
     // SAFETY: context is a live StoredFrame through callback or retained reference.
-    unsafe { crate::leases::retain_resource(context) }
+    // SAFETY: the capture callback or a retained resource pins this box/source.
+    let lease = unsafe { &*context.cast::<ResourceLease>() };
+    let source = lease.source_context;
+    let status = unsafe { crate::leases::retain_resource(source) };
+    if status == STATUS_OK {
+        lease.references.set(lease.references.get() + 1);
+    }
+    status
 }
 unsafe extern "C" fn release(context: *mut c_void, completion: *const FrameDescriptor) {
     // Invalid descriptors or failed duplication quarantine the retained storage.
@@ -218,7 +244,10 @@ unsafe extern "C" fn release(context: *mut c_void, completion: *const FrameDescr
         }
     };
     // SAFETY: consumes exactly one retained reference and transfers duplicated fd.
-    unsafe { crate::leases::release_resource(context, fd) };
+    let lease = unsafe { &*context.cast::<ResourceLease>() };
+    let source = lease.source_context;
+    unsafe { crate::leases::release_resource(source, fd) };
+    unsafe { drop_reference(context) };
 }
 
 pub(super) unsafe extern "C" fn read<B: Backend>(
@@ -232,10 +261,12 @@ pub(super) unsafe extern "C" fn read<B: Backend>(
         }
         // SAFETY: broker retains binding through synchronous call.
         let binding = unsafe { &*context.cast::<Binding<B>>() };
-        let frames = match binding.reader(stream) {
-            Ok(reader) => reader.frames,
+        let reader = match binding.reader(stream) {
+            Ok(reader) => reader,
             Err(status) => return status,
         };
+        let setup = reader.resource_setup;
+        let frames = reader.frames;
         let Some(_admission) = frames.admission.enter() else {
             return MEDIA_CLOSED;
         };
@@ -243,7 +274,7 @@ pub(super) unsafe extern "C" fn read<B: Backend>(
             Ok(value) => value,
             Err(status) => return status,
         };
-        let lease = match lent.lease() {
+        let _lease = match lent.lease() {
             Ok(value) => value,
             Err(status) => return frames.finish(lent, status),
         };
@@ -262,13 +293,37 @@ pub(super) unsafe extern "C" fn read<B: Backend>(
             }
             state.generation
         };
-        let frame = lent.frame();
-        let clock = FrameClockMetadata {
+        let mut resource = *lent.frame();
+        let mut clock = FrameClockMetadata {
             version: 1,
             size: size_of::<FrameClockMetadata>() as u32,
             domain: FRAME_CLOCK_STREAM_RELATIVE,
             ..Default::default()
         };
+        if let Some(requested) = setup.clock {
+            let epoch = match requested.epoch() {
+                Ok(epoch) => epoch,
+                Err(_) => return frames.finish(lent, MEDIA_UNSUPPORTED),
+            };
+            let timestamp = lent.host_timestamp_us();
+            if timestamp == 0 {
+                return frames.finish(lent, MEDIA_UNSUPPORTED);
+            }
+            resource.timestamp_us = timestamp;
+            clock.domain = super::sdk_resource::FRAME_CLOCK_HOST_MONOTONIC;
+            clock.epoch_id = epoch;
+        }
+        let source = lent.source();
+        let source_context = Arc::as_ptr(&source).cast_mut().cast();
+        let resource = Box::into_raw(Box::new(ResourceLease {
+            frame: resource,
+            source_context,
+            borrowed_source: Some(source),
+            references: Cell::new(1),
+        }));
+        // SAFETY: this sentinel keeps adjusted descriptor storage and pixels
+        // live through the synchronous callback; retained references extend it.
+        let frame = unsafe { &(*resource).frame };
         let offered = CaptureResourceFrame {
             offer_generation: generation,
             offer_id: 1,
@@ -304,12 +359,20 @@ pub(super) unsafe extern "C" fn read<B: Backend>(
                 (frame as *const DmaBufFrame).cast(),
             ),
             acquire_sync: none(),
-            context: lease.context,
+            context: resource.cast(),
             retain,
             release,
         };
         // SAFETY: the lent frame and descriptors remain live through the callback.
         let status = unsafe { (sink.write)(sink.context, &offered) };
+        // SAFETY: consume only the callback sentinel; each successful retained
+        // reference independently pins both the descriptor and source storage.
+        unsafe {
+            // Each retained reference owns its own source Arc. Retire only the
+            // callback's temporary Arc before consuming its descriptor sentinel.
+            (*resource).borrowed_source.take();
+            drop_reference(resource.cast());
+        }
         frames.finish(lent, status)
     })
 }

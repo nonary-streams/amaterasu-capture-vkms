@@ -6,7 +6,7 @@ use crate::{
     geometry::{self, LayoutOutput},
     model::{
         CaptureError, CaptureResult, MAX_ENUMERATION_LIMIT, MAX_LIFETIME_STREAMS, MAX_STREAMS,
-        Operation, Settings, new_id, validate_operation_id,
+        Operation, ResourceSetup, Settings, new_id, validate_operation_id,
     },
     output_name::OutputName,
     presenter::PresentationThread,
@@ -54,6 +54,7 @@ struct Stream {
     geometry: StreamGeometry,
     frames: Arc<StreamFrames>,
     presenter: PresentationThread,
+    resource_setup: ResourceSetup,
     next_resolve_ms: u64,
 }
 
@@ -77,6 +78,7 @@ impl Reply {
 pub struct Reader {
     pub frames: Arc<StreamFrames>,
     pub geometry: StreamGeometry,
+    pub resource_setup: ResourceSetup,
 }
 
 #[derive(Clone, Debug)]
@@ -135,12 +137,15 @@ impl<B: Backend> Controller<B> {
                 output,
                 operation_id,
                 constant_rate,
+                resource_capture_clock,
+                resource_callback_contract,
             } => self.open(
                 caller,
                 &output,
                 operation_id,
                 constant_rate.unwrap_or(false),
                 now,
+                ResourceSetup::new(resource_capture_clock, resource_callback_contract)?,
             ),
             Operation::Lookup { operation_id } => {
                 validate_operation_id(&operation_id)?;
@@ -175,6 +180,7 @@ impl<B: Backend> Controller<B> {
         operation: Option<String>,
         constant_rate: bool,
         now: u64,
+        resource_setup: ResourceSetup,
     ) -> CaptureResult<Reply> {
         self.authorize_capture(caller)?;
         if constant_rate {
@@ -185,7 +191,7 @@ impl<B: Backend> Controller<B> {
         let name =
             OutputName::parse(output).ok_or_else(|| CaptureError::code("invalid_named_output"))?;
         if let Some((id, existing)) = self.find_operation(caller, &operation) {
-            if existing.binding.output != name {
+            if existing.binding.output != name || existing.resource_setup != resource_setup {
                 return Err(CaptureError::code("operation_conflict"));
             }
             return Ok(Reply::existing(stream_reply(id, existing)));
@@ -228,6 +234,7 @@ impl<B: Backend> Controller<B> {
             frames,
             presenter,
             next_resolve_ms: now + RESOLVE_INTERVAL_MS,
+            resource_setup,
         };
         let payload = stream_reply(id, &stream);
         self.streams.insert(id, stream);
@@ -270,6 +277,7 @@ impl<B: Backend> Controller<B> {
         Ok(Reader {
             frames: stream.frames.clone(),
             geometry: stream.geometry,
+            resource_setup: stream.resource_setup.clone(),
         })
     }
 
@@ -490,6 +498,10 @@ fn stream_reply(id: u64, stream: &Stream) -> Value {
         "frame_transport": "dmabuf",
         "geometry_supported": stream.geometry.supported(),
     });
+    if let Some(clock) = &stream.resource_setup.clock {
+        reply["resource_capture_clock"] = json!(clock);
+        reply["resource_callback_contract"] = json!("cross_service_safe");
+    }
     if let StreamGeometry::Ready(geometry) = stream.geometry {
         reply["desktop_geometry"] = json!(geometry);
     }

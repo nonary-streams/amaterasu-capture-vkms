@@ -8,6 +8,14 @@ const HEADER: &str = "src/platform/wayland_outputs.h";
 const XDG_OUTPUT: &str = "protocols/xdg-output-unstable-v1.xml";
 
 fn main() {
+    // The published SDK pin predates typed registration. The isolated draft
+    // SDK build opts in explicitly; normal/all-feature published builds keep
+    // their existing registration until that pin can be advanced atomically.
+    println!("cargo:rustc-check-cfg=cfg(amaterasu_typed_native)");
+    println!("cargo:rerun-if-env-changed=AMATERASU_CAPTURE_TYPED_NATIVE");
+    if env::var("AMATERASU_CAPTURE_TYPED_NATIVE").as_deref() == Ok("1") {
+        println!("cargo:rustc-cfg=amaterasu_typed_native");
+    }
     build_gpu_snapshot();
     println!("cargo:rustc-check-cfg=cfg(amaterasu_kwin_geometry)");
     println!("cargo:rerun-if-changed={ADAPTER}");

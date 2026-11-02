@@ -68,11 +68,15 @@ pub struct StoredFrame {
     immutable: bool,
     producer_held: bool,
     hdr_metadata: [u16; 12],
+    host_timestamp_us: u64,
 }
 
 impl StoredFrame {
     pub fn frame(&self) -> &DmaBufFrame {
         &self.frame
+    }
+    pub fn host_timestamp_us(&self) -> u64 {
+        self.host_timestamp_us
     }
     pub fn hdr_metadata(&self) -> [u16; 12] {
         self.hdr_metadata
@@ -118,6 +122,12 @@ pub struct Lent<'a> {
 }
 
 impl Lent<'_> {
+    pub fn source(&self) -> Arc<StoredFrame> {
+        self.stored.clone()
+    }
+    pub fn host_timestamp_us(&self) -> u64 {
+        self.stored.host_timestamp_us()
+    }
     pub fn frame(&self) -> &DmaBufFrame {
         &self.stored.frame
     }
@@ -431,6 +441,7 @@ fn describe(
         immutable,
         producer_held: false,
         hdr_metadata: descriptor.hdr_metadata,
+        host_timestamp_us: descriptor.timestamp_ns / 1000,
     })
 }
 

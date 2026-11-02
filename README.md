@@ -102,3 +102,30 @@ Protocol 4 carries native GPU DMA-BUFs and separate driver read guards. The
 helper verifies that both exports describe the same presentation. Consumers
 retain the guards through source GPU completion; snapshots then retain only
 their independent allocation. This preserves NVIDIA import compatibility.
+
+## Direct guarded resources and negotiated clocks
+
+For a direct GPU capture-to-encoder path, build capture/helper with
+`driver-read-leases`, select `gpu_snapshot:false,require_lease:true`, and use a
+matching protocol-4 helper and guarded driver. This selection now permits direct
+immutable exports without the snapshot feature. Unsupported guarded capture
+fails closed. Unlike the snapshot composition above, the direct consumer keeps
+the scanout guard until its own GPU reads finish; slow or stuck readers can
+therefore stall presentation.
+
+An authorized resource consumer may open with both
+`resource_capture_clock:{"domain":"host_monotonic","epoch_id":"<32 hex digits>"}`
+and `resource_callback_contract:"cross_service_safe"`. The nonzero epoch is an
+explicit agreement; timestamps come from the exact exported driver presentation,
+not an inferred first-frame offset. Both resource and DMA-BUF timestamps agree.
+Legacy opens retain their stream-relative behavior. Retained resource frames pin
+the adjusted metadata descriptor as well as the source allocation. No pixels are
+copied by clock negotiation.
+
+The explicit development setting `AMATERASU_CAPTURE_TYPED_NATIVE=1` registers
+the public capture contract when building against a draft SDK supporting typed
+native registration. The published SDK pin does not yet offer that API, so
+normal builds, including all-feature builds, keep their existing registration. Amaterasu's development capture-build script generates an isolated
+manifest using its local SDK without changing this repository's dependency pins.
+Live PyroWave capture remains subject to independent helper/driver/GPU
+qualification; an encoder's rendered-fixture test alone does not prove capture.

@@ -136,6 +136,8 @@ fn setup() -> (Box<Factory<FakeBackend>>, Arc<SourceScript>, u64) {
                 output: "kwin:Virtual-9".into(),
                 operation_id: Some("video".into()),
                 constant_rate: None,
+                resource_capture_clock: None,
+                resource_callback_contract: None,
             },
             0,
         )
@@ -278,6 +280,8 @@ fn geometry_is_busy_while_not_ready_and_unsupported_without_wayland() {
                     output: "kwin:Virtual-9".into(),
                     operation_id: Some("video".into()),
                     constant_rate: None,
+                    resource_capture_clock: None,
+                    resource_callback_contract: None,
                 },
                 0,
             )
@@ -661,4 +665,137 @@ fn hdr_tail_tracks_the_completed_snapshot_and_preserves_old_bindings() {
     );
     assert_eq!(metadata.enabled, 0);
     assert_eq!(metadata.fields, [0; 12]);
+}
+
+#[test]
+fn negotiated_resource_clock_uses_the_presentation_and_survives_retention() {
+    use super::sdk_resource::{
+        CaptureResourceFrame, CaptureResourceFrameSink, CaptureResourceOffer,
+        CaptureResourceOfferSink, FRAME_CLOCK_HOST_MONOTONIC, FRAME_SYNC_NONE, FrameDescriptor,
+    };
+    let _serial = crate::leases::TEST_LEASE_CALLBACKS.lock().unwrap();
+    let backend = FakeBackend::new();
+    let script = backend.script.clone();
+    let mut controller = Controller::new(backend, settings());
+    let request = serde_json::json!({"action":"open","output":"kwin:Virtual-9","operation_id":"clocked",
+        "resource_capture_clock":{"domain":"host_monotonic","epoch_id":"11111111111111111111111111111111"},"resource_callback_contract":"cross_service_safe"});
+    let reply = controller
+        .handle(
+            "amaterasu.video",
+            serde_json::from_value(request.clone()).unwrap(),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        reply.payload["resource_capture_clock"],
+        request["resource_capture_clock"]
+    );
+    assert_eq!(
+        reply.payload["resource_callback_contract"],
+        "cross_service_safe"
+    );
+    let id = reply.created.unwrap();
+    let mut conflict = request;
+    conflict["resource_capture_clock"]["epoch_id"] =
+        serde_json::json!("22222222222222222222222222222222");
+    assert_eq!(
+        controller
+            .handle(
+                "amaterasu.video",
+                serde_json::from_value(conflict).unwrap(),
+                0
+            )
+            .err()
+            .unwrap()
+            .code,
+        "operation_conflict"
+    );
+    let mut factory = Factory::new(Arc::new(Mutex::new(controller)));
+    factory.header = capture_header(true);
+    let binding = TestBinding::bind(&factory, b"amaterasu.video", 8).unwrap();
+    let api = unsafe { &*binding.0.cast::<CaptureApiV1_8>() };
+    let frames = factory
+        .controller
+        .lock()
+        .unwrap()
+        .reader("amaterasu.video", id)
+        .unwrap()
+        .frames;
+    let mut source = script.export(11, 1_234_567_000, false);
+    source.descriptor.color = 2;
+    source.descriptor.fourcc = u32::from_le_bytes(*b"AR30");
+    frames.store_snapshot(source, 11);
+    unsafe extern "C" fn offer(_: *mut c_void, _: *const CaptureResourceOffer) -> Status {
+        STATUS_OK
+    }
+    let context = api.base.base.base.context;
+    let mut generation = 0;
+    assert_eq!(
+        unsafe {
+            (api.enumerate_resources)(
+                context,
+                id,
+                CaptureResourceOfferSink {
+                    context: std::ptr::null_mut(),
+                    write: offer,
+                },
+                &mut generation,
+            )
+        },
+        STATUS_OK
+    );
+    assert_eq!(
+        unsafe { (api.select_resource)(context, id, generation, 1) },
+        STATUS_OK
+    );
+    unsafe extern "C" fn retain_frame(
+        context: *mut c_void,
+        frame: *const CaptureResourceFrame,
+    ) -> Status {
+        // SAFETY: native capture lends this exact frame for the callback.
+        let frame = unsafe { &*frame };
+        assert_eq!(unsafe { (frame.retain)(frame.context) }, STATUS_OK);
+        unsafe {
+            *context.cast::<Option<CaptureResourceFrame>>() = Some(*frame);
+        }
+        STATUS_OK
+    }
+    let mut retained = None::<CaptureResourceFrame>;
+    assert_eq!(
+        unsafe {
+            (api.read_resource_frame)(
+                context,
+                id,
+                CaptureResourceFrameSink {
+                    context: (&mut retained as *mut Option<_>).cast(),
+                    write: retain_frame,
+                },
+            )
+        },
+        STATUS_OK
+    );
+    let retained = retained.unwrap();
+    frames.store_snapshot(script.export(12, 1_234_568_000, false), 12);
+    assert_eq!(retained.timestamp_us, 1_234_567);
+    assert_eq!(retained.clock.domain, FRAME_CLOCK_HOST_MONOTONIC);
+    assert_eq!(retained.clock.epoch_id, [0x11; 16]);
+    // The metadata descriptor itself stays live, not only the source fds.
+    let resource = unsafe { &*retained.resource.data.cast::<DmaBufFrame>() };
+    assert_eq!(resource.timestamp_us, retained.timestamp_us);
+    assert_eq!(resource.sequence, 11);
+    assert_eq!(resource.fourcc, u32::from_le_bytes(*b"AR30"));
+    assert_eq!(
+        retained.color.transfer,
+        super::sdk_resource::FRAME_TRANSFER_PQ
+    );
+    let done = FrameDescriptor {
+        kind: FRAME_SYNC_NONE,
+        version: 0,
+        size: 0,
+        reserved: 0,
+        namespace: [0; 16],
+        data: std::ptr::null(),
+    };
+    unsafe { (retained.release)(retained.context, &done) };
+    assert_eq!(script.open_descriptors(), 1);
 }

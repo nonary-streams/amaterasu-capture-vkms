@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -65,17 +65,17 @@ pub struct Settings {
     pub authority_channel_fd: Option<i32>,
     /// Copies scanout into independent GPU storage before advertising leases.
     pub gpu_snapshot: bool,
-    /// Require immutable leases backed by a protected GPU snapshot. Never lend
-    /// the ordinary borrowed-frame interface in this mode.
+    /// Require immutable driver read leases, directly or through a guarded GPU
+    /// snapshot. Never lend the ordinary borrowed-frame interface in this mode.
     pub require_lease: bool,
 }
 
 impl Settings {
     pub fn validate(&self) -> CaptureResult<()> {
-        if self.require_lease && (!self.gpu_snapshot || !cfg!(feature = "driver-read-leases")) {
+        if self.require_lease && !cfg!(feature = "driver-read-leases") {
             return Err(CaptureError::new(
                 "lease_source_unavailable",
-                "require_lease needs gpu_snapshot and a driver-read-leases build",
+                "require_lease needs a driver-read-leases build",
             ));
         }
         let helper_valid = self
@@ -141,6 +141,60 @@ fn valid_principals(principals: &BTreeSet<String>) -> bool {
         })
 }
 
+/// An explicit clock requested by an authorized resource consumer. Timestamp
+/// conversion uses the driver's stored presentation time, never a guessed origin.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceCaptureClock {
+    pub domain: String,
+    pub epoch_id: String,
+}
+impl ResourceCaptureClock {
+    pub fn epoch(&self) -> CaptureResult<[u8; 16]> {
+        if self.domain != "host_monotonic" || self.epoch_id.len() != 32 {
+            return Err(CaptureError::code("invalid_resource_clock"));
+        }
+        let mut epoch = [0; 16];
+        for (index, slot) in epoch.iter_mut().enumerate() {
+            let chunk = self
+                .epoch_id
+                .as_bytes()
+                .get(index * 2..index * 2 + 2)
+                .ok_or_else(|| CaptureError::code("invalid_resource_clock"))?;
+            let token = std::str::from_utf8(chunk)
+                .map_err(|_| CaptureError::code("invalid_resource_clock"))?;
+            *slot = u8::from_str_radix(token, 16)
+                .map_err(|_| CaptureError::code("invalid_resource_clock"))?;
+        }
+        if epoch == [0; 16] {
+            return Err(CaptureError::code("invalid_resource_clock"));
+        }
+        Ok(epoch)
+    }
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResourceSetup {
+    pub clock: Option<ResourceCaptureClock>,
+    pub cross_service_safe: bool,
+}
+impl ResourceSetup {
+    pub fn new(
+        clock: Option<ResourceCaptureClock>,
+        callback: Option<String>,
+    ) -> CaptureResult<Self> {
+        match (&clock, callback.as_deref()) {
+            (None, None) => {}
+            (Some(clock), Some("cross_service_safe")) => {
+                clock.epoch()?;
+            }
+            _ => return Err(CaptureError::code("invalid_resource_callback_contract")),
+        }
+        Ok(Self {
+            cross_service_safe: clock.is_some(),
+            clock,
+        })
+    }
+}
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
@@ -153,6 +207,8 @@ pub enum Operation {
         output: String,
         operation_id: Option<String>,
         constant_rate: Option<bool>,
+        resource_capture_clock: Option<ResourceCaptureClock>,
+        resource_callback_contract: Option<String>,
     },
     Lookup {
         operation_id: String,
@@ -184,12 +240,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn required_leases_need_both_a_snapshot_and_a_guarded_source() {
+    fn required_leases_allow_direct_guarded_capture_without_a_snapshot() {
         let mut settings = Settings {
             require_lease: true,
             ..Settings::default()
         };
-        assert!(settings.validate().is_err());
+        assert_eq!(
+            settings.validate().is_ok(),
+            cfg!(feature = "driver-read-leases")
+        );
         settings.gpu_snapshot = true;
         assert_eq!(
             settings.validate().is_ok(),
@@ -272,5 +331,37 @@ mod tests {
             )
             .is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod resource_clock_tests {
+    use super::*;
+    #[test]
+    fn resource_clocks_require_an_explicit_known_epoch_and_callback_contract() {
+        let valid = ResourceCaptureClock {
+            domain: "host_monotonic".into(),
+            epoch_id: "11111111111111111111111111111111".into(),
+        };
+        assert_eq!(valid.epoch().unwrap(), [0x11; 16]);
+        assert!(ResourceSetup::new(Some(valid.clone()), Some("cross_service_safe".into())).is_ok());
+        assert!(ResourceSetup::new(Some(valid.clone()), None).is_err());
+        assert!(ResourceSetup::new(None, Some("cross_service_safe".into())).is_err());
+        assert!(ResourceSetup::new(Some(valid.clone()), Some("guess".into())).is_err());
+        for (domain, epoch) in [
+            ("stream_relative", valid.epoch_id.as_str()),
+            ("host_monotonic", "00000000000000000000000000000000"),
+            ("host_monotonic", "g1111111111111111111111111111111"),
+            ("host_monotonic", "短"),
+        ] {
+            assert!(
+                ResourceCaptureClock {
+                    domain: domain.into(),
+                    epoch_id: epoch.into()
+                }
+                .epoch()
+                .is_err()
+            );
+        }
     }
 }

@@ -17,6 +17,8 @@ fn open(output: &str, operation: &str) -> Operation {
         output: output.into(),
         operation_id: Some(operation.into()),
         constant_rate: None,
+        resource_capture_clock: None,
+        resource_callback_contract: None,
     }
 }
 
@@ -118,6 +120,8 @@ fn definite_refusals_are_error_replies_with_codes() {
                 output: "kwin:Virtual-9".into(),
                 operation_id: None,
                 constant_rate: None,
+                resource_capture_clock: None,
+                resource_callback_contract: None,
             }
         ),
         "operation_id_required"
@@ -129,6 +133,8 @@ fn definite_refusals_are_error_replies_with_codes() {
                 output: "kwin:Virtual-9".into(),
                 operation_id: Some("a".into()),
                 constant_rate: Some(true),
+                resource_capture_clock: None,
+                resource_callback_contract: None,
             }
         ),
         "unsupported_constant_rate"
