@@ -295,6 +295,7 @@ impl<B: Backend> Controller<B> {
         if let Some(mut stream) = self.streams.remove(&id) {
             stream.frames.admission.close();
             stream.presenter.stop();
+            stream.frames.events.close("stream_closed");
             self.closed.insert(id, stream.owner);
         }
     }

@@ -14,6 +14,7 @@ mod admission;
 mod backend;
 mod controller;
 mod discovery;
+mod events;
 mod frames;
 mod geometry;
 mod leases;

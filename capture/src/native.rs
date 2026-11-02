@@ -74,6 +74,7 @@ fn capture_header(retained: bool) -> AbiHeader {
 struct Binding<B: Backend> {
     api: CaptureApiV1_9,
     resources: Mutex<std::collections::HashMap<u64, resource::OfferState>>,
+    subscriptions: Mutex<std::collections::HashMap<u64, Arc<crate::frames::StreamFrames>>>,
     controller: Shared<B>,
     caller: String,
     require_lease: bool,
@@ -103,8 +104,8 @@ impl<B: Backend> Binding<B> {
                         latest_presentation: latest_presentation::<B>,
                         read_dmabuf_frame_leased: read_dmabuf_frame_leased::<B>,
                     },
-                    subscribe_events: unsupported_events,
-                    unsubscribe_events,
+                    subscribe_events: subscribe_events::<B>,
+                    unsubscribe_events: unsubscribe_events::<B>,
                     resolve_swap: unsupported_swap,
                 },
                 enumerate_resources: resource::enumerate::<B>,
@@ -113,6 +114,7 @@ impl<B: Backend> Binding<B> {
                 hdr_metadata: hdr_metadata::<B>,
             },
             resources: Mutex::new(std::collections::HashMap::new()),
+            subscriptions: Mutex::new(std::collections::HashMap::new()),
             controller,
             caller,
             require_lease,
@@ -193,7 +195,17 @@ unsafe extern "C" fn release<B: Backend>(context: *mut c_void) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         if !context.is_null() {
             // SAFETY: broker uniquely releases the binding after native calls stop.
-            unsafe { drop(Box::from_raw(context.cast::<Binding<B>>())) };
+            let binding = unsafe { Box::from_raw(context.cast::<Binding<B>>()) };
+            for frames in binding
+                .subscriptions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .drain()
+                .map(|(_, frames)| frames)
+            {
+                frames.events.unsubscribe();
+            }
+            drop(binding);
         }
     }));
 }
@@ -356,10 +368,51 @@ fn guarded(operation: impl FnOnce() -> Status) -> Status {
     catch_unwind(AssertUnwindSafe(operation)).unwrap_or(STATUS_INTERNAL_ERROR)
 }
 
-unsafe extern "C" fn unsupported_events(_: *mut c_void, _: u64, _: CaptureEventSink) -> Status {
-    MEDIA_UNSUPPORTED
+unsafe extern "C" fn subscribe_events<B: Backend>(
+    context: *mut c_void,
+    stream: u64,
+    sink: CaptureEventSink,
+) -> Status {
+    guarded(|| {
+        if context.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the broker retains this binding through the synchronous call.
+        let binding = unsafe { &*context.cast::<Binding<B>>() };
+        let frames = match binding.reader(stream) {
+            Ok(reader) => reader.frames,
+            Err(status) => return status,
+        };
+        let mut subscriptions = binding
+            .subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: caller keeps the sink live until unsubscribe, binding release or
+        // stream close. The per-stream slot serializes publications with retirement.
+        let status = unsafe { frames.events.subscribe(sink) };
+        if status == STATUS_OK {
+            subscriptions.insert(stream, frames);
+        }
+        status
+    })
 }
-unsafe extern "C" fn unsubscribe_events(_: *mut c_void, _: u64) {}
+unsafe extern "C" fn unsubscribe_events<B: Backend>(context: *mut c_void, stream: u64) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if context.is_null() {
+            return;
+        }
+        // SAFETY: the broker retains this binding through the synchronous call.
+        let binding = unsafe { &*context.cast::<Binding<B>>() };
+        if let Some(frames) = binding
+            .subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&stream)
+        {
+            frames.events.unsubscribe();
+        }
+    }));
+}
 unsafe extern "C" fn unsupported_swap(
     _: *mut c_void,
     _: u64,
@@ -371,7 +424,7 @@ unsafe extern "C" fn unsupported_swap(
 }
 
 mod resource;
-mod sdk_resource;
+pub(crate) mod sdk_resource;
 unsafe extern "C" fn hdr_metadata<B: Backend>(
     context: *mut c_void,
     stream: u64,

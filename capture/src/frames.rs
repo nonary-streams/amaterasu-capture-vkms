@@ -94,6 +94,7 @@ struct Newest {
 
 pub struct StreamFrames {
     pub admission: Arc<Admission>,
+    pub(crate) events: crate::events::Events,
     newest: Mutex<Newest>,
     /// Serializes reads so freshness accounting sees one sink at a time.
     reading: Mutex<()>,
@@ -131,6 +132,7 @@ impl StreamFrames {
     pub fn new(crtc_id: u32, epoch_ns: u64) -> Self {
         Self {
             admission: Arc::new(Admission::default()),
+            events: crate::events::Events::default(),
             newest: Mutex::new(Newest {
                 presentation: PresentationStatus::default(),
                 frame: Err(MEDIA_PENDING),
@@ -193,7 +195,9 @@ impl StreamFrames {
     /// Records why delivery stopped. The first fault is kept.
     pub fn set_fault(&self, fault: StreamFault) {
         let mut current = self.fault.lock().unwrap_or_else(PoisonError::into_inner);
-        current.get_or_insert(fault);
+        let reason = current.get_or_insert(fault).code();
+        drop(current);
+        self.events.close(reason);
     }
 
     /// The newest stored presentation; sequence zero before the first.
@@ -248,8 +252,10 @@ impl StreamFrames {
             };
             std::mem::replace(&mut newest.frame, frame)
         };
-        // The old descriptors close outside the lock.
+        // The old descriptors close outside the lock. Publish only after all
+        // frame state is visible; callbacks never acquire pixels inline.
         drop(replaced);
+        self.events.ready();
     }
 
     /// Drop only the mailbox reference; any active or retained read keeps its lease.

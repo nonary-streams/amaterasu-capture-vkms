@@ -662,3 +662,99 @@ fn hdr_tail_tracks_the_completed_snapshot_and_preserves_old_bindings() {
     assert_eq!(metadata.enabled, 0);
     assert_eq!(metadata.fields, [0; 12]);
 }
+
+#[test]
+fn readiness_subscription_authorization_and_binding_release_follow_stream_ownership() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Notices {
+        ready: AtomicUsize,
+        stopped: AtomicUsize,
+    }
+    unsafe extern "C" fn ready(context: *mut c_void) {
+        // SAFETY: the fixture lives through binding release/stream close.
+        unsafe { &*context.cast::<Notices>() }
+            .ready
+            .fetch_add(1, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn stopped(context: *mut c_void, _: BorrowedBytes) {
+        // SAFETY: same retained fixture as readiness callback.
+        unsafe { &*context.cast::<Notices>() }
+            .stopped
+            .fetch_add(1, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn swap(
+        _: *mut c_void,
+        _: *const sdk_resource::CaptureSwapRequest,
+    ) -> Status {
+        MEDIA_UNSUPPORTED
+    }
+    let notices = Notices {
+        ready: AtomicUsize::new(0),
+        stopped: AtomicUsize::new(0),
+    };
+    let sink = CaptureEventSink {
+        context: (&notices as *const Notices).cast_mut().cast(),
+        frame_ready: ready,
+        request_swap: swap,
+        stopped,
+    };
+    let (mut factory, script, stream) = setup();
+    // The fake backend exercises the retained mode's existing v1.7 contract.
+    factory.header = capture_header(true);
+    let bind = |caller: &[u8]| {
+        TestBinding::bind_sized(&factory, caller, 7, size_of::<CaptureApiV1_7>() as u32).unwrap()
+    };
+    let owner = bind(b"amaterasu.video");
+    let stranger = bind(b"other.video");
+    // SAFETY: bind negotiated the complete v1.7 event tail.
+    let owner_api = unsafe { &*owner.0.cast::<CaptureApiV1_7>() };
+    let stranger_api = unsafe { &*stranger.0.cast::<CaptureApiV1_7>() };
+    assert_eq!(
+        unsafe { (stranger_api.subscribe_events)(stranger_api.base.base.context, stream, sink) },
+        MEDIA_CLOSED
+    );
+    let frames = factory
+        .controller
+        .lock()
+        .unwrap()
+        .reader("amaterasu.video", stream)
+        .unwrap()
+        .frames;
+    frames.store_snapshot(script.export(1, 1000, false), 1);
+    assert_eq!(
+        unsafe { (owner_api.subscribe_events)(owner_api.base.base.context, stream, sink) },
+        STATUS_OK
+    );
+    assert_eq!(notices.ready.load(Ordering::SeqCst), 1);
+    // A separate binding that fails admission must never clear the owner's sink.
+    let duplicate = bind(b"amaterasu.video");
+    let duplicate_api = unsafe { &*duplicate.0.cast::<CaptureApiV1_7>() };
+    assert_eq!(
+        unsafe { (duplicate_api.subscribe_events)(duplicate_api.base.base.context, stream, sink) },
+        MEDIA_BUSY
+    );
+    drop(duplicate);
+    drop(stranger);
+    frames.events.ready();
+    assert_eq!(notices.ready.load(Ordering::SeqCst), 2);
+    drop(owner); // release is itself the synchronous unsubscribe barrier.
+    frames.events.ready();
+    assert_eq!(notices.ready.load(Ordering::SeqCst), 2);
+    let owner = bind(b"amaterasu.video");
+    let api = unsafe { &*owner.0.cast::<CaptureApiV1_7>() };
+    assert_eq!(
+        unsafe { (api.subscribe_events)(api.base.base.context, stream, sink) },
+        STATUS_OK
+    );
+    factory
+        .controller
+        .lock()
+        .unwrap()
+        .close("amaterasu.video", stream)
+        .unwrap();
+    assert_eq!(notices.stopped.load(Ordering::SeqCst), 1);
+    unsafe { (api.unsubscribe_events)(api.base.base.context, stream) };
+    drop(owner);
+    frames.events.ready();
+    assert_eq!(notices.ready.load(Ordering::SeqCst), 3);
+}
