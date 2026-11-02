@@ -1,0 +1,43 @@
+//! Local Linux scheduling bridge until the separately pinned SDK publishes its
+//! threading helper. Keep the capability boundary aligned with the host SDK;
+//! this provider remains independently buildable against its existing SDK pin.
+mod linux;
+
+pub fn configure_capture_thread() {
+    if let Err(error) = linux::set(-15) {
+        eprintln!("VKMS capture thread critical priority unavailable: {error}");
+    }
+}
+
+/// Only the legacy per-stream helper inherits capture priority. Restore the
+/// module caller before other providers or application launchers can run.
+pub struct ScopedCapturePriority {
+    previous: Option<i32>,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl ScopedCapturePriority {
+    pub fn enter() -> Self {
+        let previous =
+            match linux::current().and_then(|previous| linux::set(-15).map(|()| previous)) {
+                Ok(previous) => Some(previous),
+                Err(error) => {
+                    eprintln!("capture helper priority unavailable: {error}");
+                    None
+                }
+            };
+        Self {
+            previous,
+            _same_thread: std::marker::PhantomData,
+        }
+    }
+}
+impl Drop for ScopedCapturePriority {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous
+            && let Err(error) = linux::set(previous)
+        {
+            eprintln!("capture helper caller priority restoration failed: {error}");
+            std::process::abort();
+        }
+    }
+}

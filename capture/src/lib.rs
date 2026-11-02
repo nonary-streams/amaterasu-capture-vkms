@@ -23,6 +23,7 @@ mod native;
 mod output_name;
 mod presenter;
 mod snapshot;
+mod threading;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use backend::NativeBackend;

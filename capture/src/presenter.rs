@@ -93,6 +93,7 @@ impl PresentationThread {
         let handle = thread::Builder::new()
             .name("vkms-presentation".into())
             .spawn(move || {
+                crate::threading::configure_capture_thread();
                 let snapshotter = if gpu_snapshot {
                     match Snapshotter::new() {
                         Ok(snapshotter) => Some(snapshotter),

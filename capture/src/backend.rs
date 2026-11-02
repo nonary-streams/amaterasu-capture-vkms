@@ -200,6 +200,7 @@ impl HelperConnection {
 fn start_helper(helper: HelperEndpoint<'_>) -> CaptureResult<HelperConnection> {
     let mut connection = match helper {
         HelperEndpoint::Executable(path) => {
+            let _priority = crate::threading::ScopedCapturePriority::enter();
             let executable = process::open_verified_helper(Path::new(path))
                 .map_err(|problem| CaptureError::frame_helper_unavailable(problem.describe()))?;
             HelperConnection::Legacy(HelperProcess::spawn(executable).map_err(|error| {
