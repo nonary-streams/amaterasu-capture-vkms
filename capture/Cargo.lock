@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "amaterasu-abi"
 version = "0.1.0"
-source = "git+https://github.com/nonary-streams/amaterasu-sdk?rev=a3268d5db84bee3ae5181aae327d8e0bfab3fbb5#a3268d5db84bee3ae5181aae327d8e0bfab3fbb5"
+source = "git+https://github.com/nonary-streams/amaterasu-sdk?rev=b6197e6145fb1f1adb67566e512a1210544b213b#b6197e6145fb1f1adb67566e512a1210544b213b"
 
 [[package]]
 name = "amaterasu-capture-vkms"
@@ -24,7 +24,7 @@ dependencies = [
 [[package]]
 name = "amaterasu-contracts"
 version = "0.1.0"
-source = "git+https://github.com/nonary-streams/amaterasu-sdk?rev=a3268d5db84bee3ae5181aae327d8e0bfab3fbb5#a3268d5db84bee3ae5181aae327d8e0bfab3fbb5"
+source = "git+https://github.com/nonary-streams/amaterasu-sdk?rev=b6197e6145fb1f1adb67566e512a1210544b213b#b6197e6145fb1f1adb67566e512a1210544b213b"
 dependencies = [
  "serde",
  "serde_json",
@@ -33,7 +33,7 @@ dependencies = [
 [[package]]
 name = "amaterasu-media"
 version = "0.1.0"
-source = "git+https://github.com/nonary-streams/amaterasu-sdk?rev=a3268d5db84bee3ae5181aae327d8e0bfab3fbb5#a3268d5db84bee3ae5181aae327d8e0bfab3fbb5"
+source = "git+https://github.com/nonary-streams/amaterasu-sdk?rev=b6197e6145fb1f1adb67566e512a1210544b213b#b6197e6145fb1f1adb67566e512a1210544b213b"
 dependencies = [
  "amaterasu-abi",
  "libc",
@@ -44,7 +44,7 @@ dependencies = [
 [[package]]
 name = "amaterasu-module-sdk"
 version = "0.1.0"
-source = "git+https://github.com/nonary-streams/amaterasu-sdk?rev=a3268d5db84bee3ae5181aae327d8e0bfab3fbb5#a3268d5db84bee3ae5181aae327d8e0bfab3fbb5"
+source = "git+https://github.com/nonary-streams/amaterasu-sdk?rev=b6197e6145fb1f1adb67566e512a1210544b213b#b6197e6145fb1f1adb67566e512a1210544b213b"
 dependencies = [
  "amaterasu-abi",
  "amaterasu-contracts",

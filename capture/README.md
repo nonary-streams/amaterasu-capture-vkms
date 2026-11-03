@@ -394,7 +394,11 @@ host SDK C layout assertions.
 The `driver-read-leases` helper now uses protocol 4 and the additive
 `GET_FRAME_COLOR` ioctl (frame ABI 2). Colour interpretation and static HDR
 metadata are latched with the completed scanout. Capture v1.9 exposes that
-metadata for the owned stream. RGB10 PQ/BT.2020 is preserved through the private
+metadata for the owned stream. Capture v1.10 reports authoritative per-frame
+colour only for a guarded source with `require_lease:true`, after a verified
+frame has arrived. Other builds return no provenance claim even if they advertise
+retained frames. Consumers must still check each frame's colour and fail on
+unknown or incompatible values. RGB10 PQ/BT.2020 is preserved through the private
 GPU snapshot; an unknown colour state or an eight-bit HDR source is refused.
 Older frame ioctls and helper protocol 1 retain their compatibility behavior.
 The corresponding driver and a 10-bit encoder are required; allocation alone

@@ -17,8 +17,8 @@ linux-kwin-geometry = []
 linux-gpu-snapshot = []
 
 [dependencies]
-amaterasu-module-sdk = { git = "https://github.com/nonary-streams/amaterasu-sdk", rev = "a3268d5db84bee3ae5181aae327d8e0bfab3fbb5" }
-amaterasu-media = { git = "https://github.com/nonary-streams/amaterasu-sdk", rev = "a3268d5db84bee3ae5181aae327d8e0bfab3fbb5" }
+amaterasu-module-sdk = { git = "https://github.com/nonary-streams/amaterasu-sdk", rev = "b6197e6145fb1f1adb67566e512a1210544b213b" }
+amaterasu-media = { git = "https://github.com/nonary-streams/amaterasu-sdk", rev = "b6197e6145fb1f1adb67566e512a1210544b213b" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 getrandom = "0.3"

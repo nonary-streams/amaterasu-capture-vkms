@@ -165,7 +165,7 @@ fn the_table_advertises_only_the_configured_frame_lifetime() {
         );
     }
     assert_eq!(
-        TestBinding::bind(&factory, b"amaterasu.video", 10).err(),
+        TestBinding::bind(&factory, b"amaterasu.video", 11).err(),
         Some(MEDIA_UNSUPPORTED)
     );
     assert_eq!(
@@ -173,7 +173,7 @@ fn the_table_advertises_only_the_configured_frame_lifetime() {
             &factory,
             b"amaterasu.video",
             5,
-            size_of::<CaptureApiV1_9>() as u32 + 8
+            size_of::<CaptureApiV1_10>() as u32 + 8
         )
         .err(),
         Some(MEDIA_UNSUPPORTED)
@@ -757,4 +757,43 @@ fn readiness_subscription_authorization_and_binding_release_follow_stream_owners
     drop(owner);
     frames.events.ready();
     assert_eq!(notices.ready.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn color_provenance_requires_guarded_source_and_completed_frame() {
+    let (mut factory, script, id) = setup();
+    factory.header = capture_header(true);
+    let binding = TestBinding::bind_sized(
+        &factory,
+        b"amaterasu.video",
+        10,
+        size_of::<CaptureApiV1_10>() as u32,
+    )
+    .unwrap();
+    let api = unsafe { &*binding.0.cast::<CaptureApiV1_10>() };
+    let context = api.base.base.base.base.context;
+    let mut flags = 99;
+    // A legacy/fake source never claims authoritative color even with snapshot support.
+    assert_eq!(
+        unsafe { (api.color_provenance)(context, id, &mut flags) },
+        STATUS_OK
+    );
+    assert_eq!(flags, 0);
+    assert_eq!(
+        unsafe { (api.color_provenance)(context, id + 1, &mut flags) },
+        MEDIA_CLOSED
+    );
+    let frames = Arc::new(crate::frames::StreamFrames::new(1, 0));
+    let reader = crate::controller::Reader {
+        frames: frames.clone(),
+        geometry: StreamGeometry::Unsupported,
+        authoritative_color: true,
+    };
+    assert_eq!(color_provenance_flags(&reader), Err(MEDIA_PENDING));
+    frames.store_snapshot(script.export(1, 1000, false), 1);
+    assert_eq!(color_provenance_flags(&reader), Ok(1));
+    frames.set_fault(crate::frames::StreamFault::HelperFailed);
+    assert_eq!(color_provenance_flags(&reader), Err(MEDIA_BACKEND_ERROR));
+    frames.admission.close();
+    assert_eq!(color_provenance_flags(&reader), Err(MEDIA_CLOSED));
 }

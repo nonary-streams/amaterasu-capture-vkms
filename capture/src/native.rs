@@ -16,7 +16,9 @@ use amaterasu_module_sdk::abi::{
     AbiHeader, BorrowedBytes, NativeInterface, NativeInterfaceQuery, NativeServiceFactory,
     STATUS_INTERNAL_ERROR, STATUS_INVALID_ARGUMENT, STATUS_OK, Status,
 };
-use sdk_resource::{CaptureApiV1_7, CaptureApiV1_9, CaptureEventSink, HdrMetadata};
+use sdk_resource::{
+    CaptureApiV1_7, CaptureApiV1_9, CaptureApiV1_10, CaptureEventSink, HdrMetadata,
+};
 use std::{
     ffi::c_void,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -58,13 +60,13 @@ impl<B: Backend + 'static> Factory<B> {
 fn capture_header(retained: bool) -> AbiHeader {
     AbiHeader {
         size: if retained {
-            size_of::<CaptureApiV1_9>() as u32
+            size_of::<CaptureApiV1_10>() as u32
         } else {
             CAPTURE_API_V1_5_SIZE
         },
         major: INTERFACE_MAJOR,
         minor: if retained {
-            9
+            10
         } else {
             CAPTURE_PRESENTATION_INTERFACE_MINOR
         },
@@ -72,7 +74,7 @@ fn capture_header(retained: bool) -> AbiHeader {
 }
 
 struct Binding<B: Backend> {
-    api: CaptureApiV1_9,
+    api: CaptureApiV1_10,
     resources: Mutex<std::collections::HashMap<u64, resource::OfferState>>,
     subscriptions: Mutex<std::collections::HashMap<u64, Arc<crate::frames::StreamFrames>>>,
     controller: Shared<B>,
@@ -88,30 +90,33 @@ impl<B: Backend> Binding<B> {
         require_lease: bool,
     ) -> Box<Self> {
         let mut binding = Box::new(Self {
-            api: CaptureApiV1_9 {
-                base: CaptureApiV1_7 {
-                    base: CaptureApiV1_6 {
-                        base: NativeInterface {
-                            header,
-                            context: std::ptr::null_mut(),
-                            release: Some(release::<B>),
+            api: CaptureApiV1_10 {
+                base: CaptureApiV1_9 {
+                    base: CaptureApiV1_7 {
+                        base: CaptureApiV1_6 {
+                            base: NativeInterface {
+                                header,
+                                context: std::ptr::null_mut(),
+                                release: Some(release::<B>),
+                            },
+                            read_frame,
+                            geometry: geometry::<B>,
+                            read_frame_with_freshness,
+                            read_frame_with_capture_timestamp,
+                            read_dmabuf_frame: read_dmabuf_frame::<B>,
+                            latest_presentation: latest_presentation::<B>,
+                            read_dmabuf_frame_leased: read_dmabuf_frame_leased::<B>,
                         },
-                        read_frame,
-                        geometry: geometry::<B>,
-                        read_frame_with_freshness,
-                        read_frame_with_capture_timestamp,
-                        read_dmabuf_frame: read_dmabuf_frame::<B>,
-                        latest_presentation: latest_presentation::<B>,
-                        read_dmabuf_frame_leased: read_dmabuf_frame_leased::<B>,
+                        subscribe_events: subscribe_events::<B>,
+                        unsubscribe_events: unsubscribe_events::<B>,
+                        resolve_swap: unsupported_swap,
                     },
-                    subscribe_events: subscribe_events::<B>,
-                    unsubscribe_events: unsubscribe_events::<B>,
-                    resolve_swap: unsupported_swap,
+                    enumerate_resources: resource::enumerate::<B>,
+                    select_resource: resource::select::<B>,
+                    read_resource_frame: resource::read::<B>,
+                    hdr_metadata: hdr_metadata::<B>,
                 },
-                enumerate_resources: resource::enumerate::<B>,
-                select_resource: resource::select::<B>,
-                read_resource_frame: resource::read::<B>,
-                hdr_metadata: hdr_metadata::<B>,
+                color_provenance: color_provenance::<B>,
             },
             resources: Mutex::new(std::collections::HashMap::new()),
             subscriptions: Mutex::new(std::collections::HashMap::new()),
@@ -119,7 +124,7 @@ impl<B: Backend> Binding<B> {
             caller,
             require_lease,
         });
-        binding.api.base.base.base.context = (&mut *binding as *mut Self).cast();
+        binding.api.base.base.base.base.context = (&mut *binding as *mut Self).cast();
         binding
     }
 
@@ -183,7 +188,7 @@ unsafe extern "C" fn bind<B: Backend + 'static>(
             factory.header,
             factory.require_lease,
         );
-        let interface = &binding.api.base.base.base as *const NativeInterface;
+        let interface = &binding.api.base.base.base.base as *const NativeInterface;
         let _ = Box::into_raw(binding);
         // SAFETY: transfers one stable boxed table, uniquely released by the broker.
         unsafe { output.write(interface) };
@@ -457,6 +462,52 @@ unsafe extern "C" fn hdr_metadata<B: Backend>(
         unsafe { output.write(metadata) };
         STATUS_OK
     })
+}
+
+/// Reports a property of the selected live stream, never of an unverified helper.
+unsafe extern "C" fn color_provenance<B: Backend>(
+    context: *mut c_void,
+    stream: u64,
+    output: *mut u32,
+) -> Status {
+    guarded(|| {
+        if context.is_null()
+            || output.is_null()
+            || !(output as usize).is_multiple_of(align_of::<u32>())
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: binding and output slot remain valid for this synchronous call.
+        let binding = unsafe { &*context.cast::<Binding<B>>() };
+        let reader = match binding.reader(stream) {
+            Ok(reader) => reader,
+            Err(status) => return status,
+        };
+        match color_provenance_flags(&reader) {
+            Ok(flags) => {
+                // SAFETY: the broker supplied an aligned writable output slot.
+                unsafe { output.write(flags) };
+                STATUS_OK
+            }
+            Err(status) => status,
+        }
+    })
+}
+
+fn color_provenance_flags(reader: &crate::controller::Reader) -> Result<u32, Status> {
+    if !reader.authoritative_color {
+        return Ok(0);
+    }
+    let Some(_admission) = reader.frames.admission.enter() else {
+        return Err(MEDIA_CLOSED);
+    };
+    // A verified descriptor must exist before making the claim. This requests
+    // the first frame on on-demand paths. All later frames use this guarded
+    // protocol-4 source and either retain authoritative color or fail closed.
+    match reader.frames.with_current_immutable(|_| STATUS_OK) {
+        STATUS_OK => Ok(amaterasu_media::CAPTURE_COLOR_PER_PRESENTATION_AUTHORITATIVE),
+        status => Err(status),
+    }
 }
 
 #[cfg(test)]

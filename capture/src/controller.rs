@@ -55,6 +55,7 @@ struct Stream {
     geometry: StreamGeometry,
     frames: Arc<StreamFrames>,
     presenter: PresentationThread,
+    authoritative_color: bool,
     next_resolve_ms: u64,
 }
 
@@ -78,6 +79,7 @@ impl Reply {
 pub struct Reader {
     pub frames: Arc<StreamFrames>,
     pub geometry: StreamGeometry,
+    pub authoritative_color: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -208,6 +210,10 @@ impl<B: Backend> Controller<B> {
             return Err(CaptureError::code("entropy_error"));
         }
         let source = self.backend.connect(helper, &binding)?;
+        // Only the guarded driver lease path obtains per-presentation color.
+        let authoritative_color = cfg!(feature = "driver-read-leases")
+            && self.settings.require_lease
+            && source.holds_producer();
         let frames = Arc::new(StreamFrames::new(
             binding.crtc_id,
             self.backend.monotonic_now_ns(),
@@ -236,6 +242,7 @@ impl<B: Backend> Controller<B> {
             geometry,
             frames,
             presenter,
+            authoritative_color,
             next_resolve_ms: now + RESOLVE_INTERVAL_MS,
         };
         let payload = stream_reply(id, &stream);
@@ -279,6 +286,7 @@ impl<B: Backend> Controller<B> {
         Ok(Reader {
             frames: stream.frames.clone(),
             geometry: stream.geometry,
+            authoritative_color: stream.authoritative_color,
         })
     }
 
