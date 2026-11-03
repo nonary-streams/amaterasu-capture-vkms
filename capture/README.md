@@ -391,6 +391,11 @@ host SDK C layout assertions.
 
 ### Guarded HDR10 capture
 
+This experimental candidate depends on SDK revision
+`b6197e6145fb1f1adb67566e512a1210544b213b`. That revision is local-only
+until it is published to the SDK repository; a clean remote build cannot
+resolve it before publication.
+
 The `driver-read-leases` helper now uses protocol 4 and the additive
 `GET_FRAME_COLOR` ioctl (frame ABI 2). Colour interpretation and static HDR
 metadata are latched with the completed scanout. Capture v1.9 exposes that
