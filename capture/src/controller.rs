@@ -12,6 +12,7 @@ use crate::{
     presenter::PresentationThread,
 };
 use amaterasu_media::CaptureGeometry;
+use amaterasu_module_sdk::LogEmitter;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -98,6 +99,7 @@ impl Availability {
 
 pub struct Controller<B: Backend> {
     backend: B,
+    logger: Option<LogEmitter>,
     settings: Settings,
     streams: BTreeMap<u64, Stream>,
     closed: BTreeMap<u64, String>,
@@ -117,12 +119,17 @@ impl<B: Backend> Controller<B> {
     pub fn new(backend: B, settings: Settings) -> Self {
         Self {
             backend,
+            logger: None,
             settings,
             streams: BTreeMap::new(),
             closed: BTreeMap::new(),
             opened: 0,
             last_availability: None,
         }
+    }
+
+    pub fn set_logger(&mut self, logger: LogEmitter) {
+        self.logger = Some(logger);
     }
 
     pub fn handle(&mut self, caller: &str, operation: Operation, now: u64) -> CaptureResult<Reply> {
@@ -209,6 +216,8 @@ impl<B: Backend> Controller<B> {
             source,
             frames.clone(),
             self.settings.gpu_snapshot,
+            id,
+            self.logger.clone(),
         )
         .map_err(|error| {
             CaptureError::new(

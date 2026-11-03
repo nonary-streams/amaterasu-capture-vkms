@@ -25,7 +25,9 @@ mod presenter;
 mod snapshot;
 mod threading;
 
-use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{
+    Command, LogQueue, ManagedModule, ModuleResult, Response, RuntimeClient,
+};
 use backend::NativeBackend;
 use controller::Controller;
 use model::{CaptureError, Operation, Settings};
@@ -39,6 +41,7 @@ const REQUESTS_PER_TICK: usize = 8;
 
 struct CaptureModule {
     runtime: RuntimeClient,
+    log_queue: LogQueue,
     controller: native::Shared<NativeBackend>,
     _factory: Box<native::Factory<NativeBackend>>,
     epoch: Instant,
@@ -52,7 +55,10 @@ impl ManagedModule for CaptureModule {
         let settings: Settings =
             serde_json::from_value(payload).map_err(|error| error.to_string())?;
         settings.validate().map_err(|error| error.message)?;
-        let controller = Arc::new(Mutex::new(Controller::new(NativeBackend::new(), settings)));
+        let (logger, log_queue) = runtime.log_emitter();
+        let mut controller = Controller::new(NativeBackend::new(), settings);
+        controller.set_logger(logger);
+        let controller = Arc::new(Mutex::new(controller));
         let factory = native::Factory::new(controller.clone());
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
@@ -62,6 +68,7 @@ impl ManagedModule for CaptureModule {
         unsafe { runtime.register_native(SERVICE, &factory.api) }?;
         Ok(Self {
             runtime,
+            log_queue,
             controller,
             _factory: factory,
             epoch: Instant::now(),
@@ -69,6 +76,7 @@ impl ManagedModule for CaptureModule {
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        self.log_queue.flush(&self.runtime);
         let now = self.epoch.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         self.lock_controller()?.refresh(now);
         for _ in 0..REQUESTS_PER_TICK {
@@ -152,6 +160,7 @@ impl Drop for CaptureModule {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .shutdown();
+        self.log_queue.flush(&self.runtime);
     }
 }
 

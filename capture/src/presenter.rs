@@ -10,9 +10,10 @@ use crate::{
     frames::{StreamFault, StreamFrames},
     snapshot::Snapshotter,
 };
+use amaterasu_module_sdk::{LogEmitter, LogLevel};
 use amaterasu_vkms_frame_helper::{
     client::{ClientError, ExportedFrame, FrameExport, Presentation},
-    protocol::{Failure, PRESENT_CHANGED},
+    protocol::{Failure, PRESENT_CHANGED, PRESENT_TIMEOUT},
 };
 use std::{
     io,
@@ -22,7 +23,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Longest single WAIT. It bounds how long a thread that cannot be
@@ -78,13 +79,15 @@ pub struct PresentationThread {
 impl PresentationThread {
     #[cfg(test)]
     pub fn spawn(source: Box<dyn FrameSource>, frames: Arc<StreamFrames>) -> io::Result<Self> {
-        Self::spawn_with_snapshot(source, frames, false)
+        Self::spawn_with_snapshot(source, frames, false, 0, None)
     }
 
     pub fn spawn_with_snapshot(
         source: Box<dyn FrameSource>,
         frames: Arc<StreamFrames>,
         gpu_snapshot: bool,
+        stream_id: u64,
+        logger: Option<LogEmitter>,
     ) -> io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let interrupt = source.interrupter();
@@ -105,7 +108,9 @@ impl PresentationThread {
                 } else {
                     None
                 };
-                let presenter = Presenter::new(source, frames.clone(), child_stop, snapshotter);
+                let mut presenter = Presenter::new(source, frames.clone(), child_stop, snapshotter);
+                presenter.stream_id = stream_id;
+                presenter.logger = logger;
                 let _ = ready.send(true);
                 if catch_unwind(AssertUnwindSafe(|| presenter.run())).is_err() {
                     frames.set_fault(StreamFault::HelperFailed);
@@ -165,6 +170,64 @@ enum Next {
     Exit,
 }
 
+#[derive(Default)]
+struct DurationSamples {
+    count: u64,
+    total_us: u64,
+    max_us: u64,
+}
+
+impl DurationSamples {
+    fn record(&mut self, elapsed: Duration) {
+        let micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.count = self.count.saturating_add(1);
+        self.total_us = self.total_us.saturating_add(micros);
+        self.max_us = self.max_us.max(micros);
+    }
+}
+
+struct DiagnosticWindow {
+    started: Instant,
+    changed: u64,
+    timeouts: u64,
+    sequence_gaps: u64,
+    export_ahead_sequences: u64,
+    empty_exports: u64,
+    publish_attempts: u64,
+    wait: DurationSamples,
+    export: DurationSamples,
+    snapshot: DurationSamples,
+}
+
+impl DiagnosticWindow {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            changed: 0,
+            timeouts: 0,
+            sequence_gaps: 0,
+            export_ahead_sequences: 0,
+            empty_exports: 0,
+            publish_attempts: 0,
+            wait: DurationSamples::default(),
+            export: DurationSamples::default(),
+            snapshot: DurationSamples::default(),
+        }
+    }
+
+    fn observe_sequence(&mut self, previous: u64, waited: u64, exported: u64) {
+        let latest = waited.max(exported);
+        if previous != 0 {
+            self.sequence_gaps = self
+                .sequence_gaps
+                .saturating_add(latest.saturating_sub(previous).saturating_sub(1));
+        }
+        self.export_ahead_sequences = self
+            .export_ahead_sequences
+            .saturating_add(exported.saturating_sub(waited));
+    }
+}
+
 /// The thread's state: the source and the CRTC sequence it has seen.
 struct Presenter {
     source: Box<dyn FrameSource>,
@@ -179,6 +242,9 @@ struct Presenter {
     consecutive_driver_errors: u32,
     snapshotter: Option<Snapshotter>,
     producer_held: bool,
+    stream_id: u64,
+    logger: Option<LogEmitter>,
+    diagnostics: DiagnosticWindow,
 }
 
 impl Presenter {
@@ -199,16 +265,59 @@ impl Presenter {
             sequence_base: 0,
             consecutive_driver_errors: 0,
             snapshotter,
+            stream_id: 0,
+            logger: None,
+            diagnostics: DiagnosticWindow::new(Instant::now()),
         }
     }
 
     fn run(mut self) {
         while !self.finished() {
-            match self.step() {
+            let next = self.step();
+            self.log_diagnostics(Instant::now(), false);
+            match next {
                 Next::Continue => {}
                 Next::Pause(delay) => thread::park_timeout(delay),
                 Next::Exit => break,
             }
+        }
+        self.log_diagnostics(Instant::now(), true);
+    }
+
+    fn log_diagnostics(&mut self, now: Instant, final_window: bool) {
+        if (!final_window
+            && now.saturating_duration_since(self.diagnostics.started) < Duration::from_secs(10))
+            || (final_window && self.diagnostics.wait.count == 0)
+        {
+            return;
+        }
+        let window = std::mem::replace(&mut self.diagnostics, DiagnosticWindow::new(now));
+        if let Some(logger) = &self.logger {
+            let message = format!(
+                "stream={} window_us={} final_window={} snapshot_enabled={} changed={} timeouts={} publish_attempts={} sequence_gaps={} export_ahead_sequences={} empty_exports={} wait_calls={} wait_total_us={} wait_max_us={} export_calls={} export_total_us={} export_max_us={} snapshot_calls={} snapshot_total_us={} snapshot_max_us={}",
+                self.stream_id,
+                now.saturating_duration_since(window.started).as_micros(),
+                final_window,
+                self.snapshotter.is_some(),
+                window.changed,
+                window.timeouts,
+                window.publish_attempts,
+                window.sequence_gaps,
+                window.export_ahead_sequences,
+                window.empty_exports,
+                window.wait.count,
+                window.wait.total_us,
+                window.wait.max_us,
+                window.export.count,
+                window.export.total_us,
+                window.export.max_us,
+                window.snapshot.count,
+                window.snapshot.total_us,
+                window.snapshot.max_us,
+            );
+            // Emission uses the SDK's bounded nonblocking producer; loss of
+            // diagnostics never blocks capture or changes frame ownership.
+            let _ = logger.emit(LogLevel::Info, "capture.presentation", &message);
         }
     }
 
@@ -227,22 +336,35 @@ impl Presenter {
         } else {
             PRESENT_WAIT_TIMEOUT_MS
         };
-        let presentation = match self
+        let started = Instant::now();
+        let result = self
             .source
-            .wait(self.crtc_id, self.driver_sequence, wait_ms)
-        {
+            .wait(self.crtc_id, self.driver_sequence, wait_ms);
+        self.diagnostics.wait.record(started.elapsed());
+        let presentation = match result {
             Ok(presentation) => presentation,
             Err(error) => return self.failed(&error),
         };
         let requested = self.producer_held && self.frames.take_capture_request();
+        if presentation.flags & PRESENT_TIMEOUT != 0 {
+            self.diagnostics.timeouts = self.diagnostics.timeouts.saturating_add(1);
+        }
         if presentation.flags & PRESENT_CHANGED == 0 && !requested {
             // A timeout: nothing new was presented.
             self.consecutive_driver_errors = 0;
             return Next::Continue;
         }
+        if presentation.flags & PRESENT_CHANGED != 0 {
+            self.diagnostics.changed = self.diagnostics.changed.saturating_add(1);
+        }
         // A direct driver lease blocks buffer retirement. Acquire it only when
         // video asks for a frame, never while an encoder is still starting.
         if self.producer_held && self.snapshotter.is_none() && !requested {
+            self.diagnostics.observe_sequence(
+                self.driver_sequence,
+                presentation.sequence,
+                presentation.sequence,
+            );
             self.driver_sequence = self.driver_sequence.max(presentation.sequence);
             self.frames.observe_presentation(
                 self.sequence_base.saturating_add(presentation.sequence),
@@ -250,13 +372,22 @@ impl Presenter {
             );
             return Next::Continue;
         }
-        match self.source.frame(self.crtc_id) {
+        let started = Instant::now();
+        let result = self.source.frame(self.crtc_id);
+        self.diagnostics.export.record(started.elapsed());
+        match result {
             Ok(FrameExport::Ready(exported)) => {
                 self.consecutive_driver_errors = 0;
                 self.publish(exported, presentation.sequence);
                 Next::Continue
             }
             Ok(FrameExport::Empty) => {
+                self.diagnostics.empty_exports = self.diagnostics.empty_exports.saturating_add(1);
+                self.diagnostics.observe_sequence(
+                    self.driver_sequence,
+                    presentation.sequence,
+                    presentation.sequence,
+                );
                 // Nothing exportable yet; wait for the next presentation
                 // rather than asking again for this one.
                 self.consecutive_driver_errors = 0;
@@ -288,19 +419,32 @@ impl Presenter {
     fn publish(&mut self, exported: ExportedFrame, waited_sequence: u64) {
         let exported_sequence = exported.descriptor.sequence;
         let previous = self.driver_sequence;
+        self.diagnostics
+            .observe_sequence(previous, waited_sequence, exported_sequence);
         self.driver_sequence = previous.max(exported_sequence).max(waited_sequence);
         if exported_sequence > previous || self.producer_held {
             let stream_sequence = self.sequence_base.saturating_add(exported_sequence);
             if let Some(snapshotter) = &mut self.snapshotter {
-                match snapshotter.snapshot(exported) {
-                    Ok(snapshot) => self.frames.store_snapshot(snapshot, stream_sequence),
+                let started = Instant::now();
+                let snapshot = snapshotter.snapshot(exported);
+                self.diagnostics.snapshot.record(started.elapsed());
+                match snapshot {
+                    Ok(snapshot) => {
+                        self.frames.store_snapshot(snapshot, stream_sequence);
+                        self.diagnostics.publish_attempts =
+                            self.diagnostics.publish_attempts.saturating_add(1);
+                    }
                     Err(_) => self.frames.set_fault(StreamFault::GpuSnapshotFailed),
                 }
             } else if self.producer_held {
                 self.frames
                     .store_leased(exported, stream_sequence, self.crtc_id);
+                self.diagnostics.publish_attempts =
+                    self.diagnostics.publish_attempts.saturating_add(1);
             } else {
                 self.frames.store(exported, stream_sequence);
+                self.diagnostics.publish_attempts =
+                    self.diagnostics.publish_attempts.saturating_add(1);
             }
         }
     }

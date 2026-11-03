@@ -270,6 +270,17 @@ hardware measurement. Ten-bit storage is not an HDR qualification: the legacy
 KMS frame metadata remains sRGB, and HDR colorimetry, encoder support and client
 playback remain separate unfinished gates.
 
+Every ten seconds each active presentation thread emits a bounded
+`capture.presentation` record through the SDK's nonblocking logger. It reports
+changed/timeout WAIT results, publication attempts and empty exports, source-sequence gaps,
+the sequence distance by which FRAME is ahead of WAIT, and count/total/maximum microseconds for WAIT,
+FRAME export, and snapshot. WAIT includes normal time spent waiting for the
+next presentation; snapshot includes acquire-fence waiting and synchronous GPU
+copy, not separate GPU execution timings. Sequence gaps mean the presenter did
+not publish every observed driver sequence, not that the game or client dropped
+that many frames. Short streams also emit a final partial window. A full log
+queue can drop a record without blocking capture.
+
 ### Threading, latency and lifetimes
 
 - Reads and queries take the controller lock with `try_lock` (busy rather

@@ -6,6 +6,93 @@ use std::time::Instant;
 
 const EPOCH_NS: u64 = 1_000_000;
 
+#[test]
+fn diagnostic_sequences_count_jumps_without_counting_initial_or_retarget_offsets() {
+    let mut metrics = DiagnosticWindow::new(Instant::now());
+    metrics.observe_sequence(0, 80, 82);
+    assert_eq!(metrics.sequence_gaps, 0);
+    assert_eq!(metrics.export_ahead_sequences, 2);
+    metrics.observe_sequence(82, 83, 86);
+    assert_eq!(metrics.sequence_gaps, 3);
+    assert_eq!(metrics.export_ahead_sequences, 5);
+    // Retargeting resets the source sequence: the first new value must not
+    // interpret the new CRTC's absolute counter as missed presentations.
+    metrics.observe_sequence(0, 1000, 1000);
+    assert_eq!(metrics.sequence_gaps, 3);
+    metrics.observe_sequence(1000, 1001, 1001);
+    assert_eq!(metrics.sequence_gaps, 3);
+}
+
+#[test]
+fn presenter_reports_driver_gaps_through_sdk_logger_without_changing_delivery() {
+    use amaterasu_module_sdk::{
+        RuntimeClient,
+        abi::{AbiHeader, BorrowedBytes, HostApi, ReplySink, Status},
+    };
+    use std::ffi::c_void;
+
+    unsafe extern "C" fn invoke(
+        context: *mut c_void,
+        input: BorrowedBytes,
+        reply: ReplySink,
+    ) -> Status {
+        // SAFETY: test retains the collector and input for this synchronous call.
+        let collector = unsafe { &mut *context.cast::<Vec<serde_json::Value>>() };
+        let bytes = unsafe { input.read() }.unwrap();
+        collector.push(serde_json::from_slice(bytes).unwrap());
+        // SAFETY: runtime owns the sink until the callback returns.
+        unsafe { reply.send(br#"{"kind":"ok"}"#) };
+        STATUS_OK
+    }
+
+    let mut records = Vec::<serde_json::Value>::new();
+    let endpoint = HostApi {
+        header: AbiHeader::of::<HostApi>(),
+        context: (&mut records as *mut Vec<serde_json::Value>).cast(),
+        invoke,
+    };
+    // SAFETY: the test retains the endpoint and collector until all calls end.
+    let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
+    let (logger, mut queue) = runtime.log_emitter();
+    let script = Arc::new(SourceScript::default());
+    let frames = Arc::new(StreamFrames::new(41, EPOCH_NS));
+    let mut presenter = Presenter::new(
+        Box::new(FakeSource::new(script.clone())),
+        frames.clone(),
+        Arc::new(AtomicBool::new(false)),
+        None,
+    );
+    presenter.logger = Some(logger);
+    presenter.stream_id = 77;
+    presenter.publish(script.export(1, EPOCH_NS, false), 1);
+    presenter.publish(script.export(4, EPOCH_NS + 24_000_000, false), 3);
+    assert_eq!(frames.latest_presentation().unwrap().sequence, 4);
+    let started = presenter.diagnostics.started;
+    presenter.log_diagnostics(started + Duration::from_secs(10), false);
+    queue.flush(&runtime);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["op"], "log");
+    assert_eq!(records[0]["target"], "capture.presentation");
+    let message = records[0]["message"].as_str().unwrap();
+    assert!(message.contains("stream=77 "));
+    assert!(message.contains("publish_attempts=2 "));
+    assert!(message.contains("sequence_gaps=2 "));
+    assert!(message.contains("export_ahead_sequences=1 "));
+    presenter.log_diagnostics(started + Duration::from_secs(11), false);
+    queue.flush(&runtime);
+    assert_eq!(records.len(), 1);
+    presenter
+        .diagnostics
+        .wait
+        .record(Duration::from_micros(123));
+    presenter.log_diagnostics(started + Duration::from_secs(11), true);
+    queue.flush(&runtime);
+    assert_eq!(records.len(), 2);
+    let final_message = records[1]["message"].as_str().unwrap();
+    assert!(final_message.contains("final_window=true "));
+    assert!(final_message.contains("wait_calls=1 wait_total_us=123 "));
+}
+
 struct Running {
     frames: Arc<StreamFrames>,
     script: Arc<SourceScript>,
