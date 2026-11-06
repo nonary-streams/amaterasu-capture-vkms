@@ -25,6 +25,10 @@ mod presenter;
 mod snapshot;
 mod threading;
 
+use amaterasu_module_sdk::capture::{
+    SourcePreflightFactory, SourcePreflightProvider, SourcePreflightRequest,
+    SourcePreflightResponse,
+};
 use amaterasu_module_sdk::{
     Command, LogQueue, ManagedModule, ModuleResult, Response, RuntimeClient,
 };
@@ -39,11 +43,27 @@ use std::{
 const SERVICE: &str = "amaterasu.capture-vkms/1";
 const REQUESTS_PER_TICK: usize = 8;
 
+struct VkmsPreflight(native::Shared<NativeBackend>);
+impl SourcePreflightProvider for VkmsPreflight {
+    fn query(
+        &self,
+        caller: &str,
+        request: &SourcePreflightRequest,
+    ) -> Result<SourcePreflightResponse, amaterasu_module_sdk::abi::Status> {
+        let controller = self.0.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => amaterasu_media::MEDIA_BUSY,
+            std::sync::TryLockError::Poisoned(_) => amaterasu_media::MEDIA_BACKEND_ERROR,
+        })?;
+        Ok(controller.preflight(caller, request))
+    }
+}
+
 struct CaptureModule {
     runtime: RuntimeClient,
     log_queue: LogQueue,
     controller: native::Shared<NativeBackend>,
     _factory: Box<native::Factory<NativeBackend>>,
+    _preflight_factory: Box<SourcePreflightFactory<VkmsPreflight>>,
     epoch: Instant,
 }
 
@@ -60,17 +80,30 @@ impl ManagedModule for CaptureModule {
         controller.set_logger(logger);
         let controller = Arc::new(Mutex::new(controller));
         let factory = native::Factory::new(controller.clone());
+        // SAFETY: the retained inner factory binds controller metadata only.
+        // Source preflight uses read-only KMS inventory and authority PRECHECK,
+        // never the old helper probe which starts a privileged helper session.
+        let preflight_factory = unsafe {
+            SourcePreflightFactory::new(&factory.api, Arc::new(VkmsPreflight(controller.clone())))
+        };
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
         // SAFETY: the boxed factory stays at a stable address until this module
         // is destroyed; every binding retains its own shared controller.
-        unsafe { runtime.register_native(SERVICE, &factory.api) }?;
+        unsafe {
+            runtime.register_native_typed(
+                SERVICE,
+                amaterasu_module_sdk::media::native_contracts::CAPTURE,
+                &preflight_factory.api,
+            )
+        }?;
         Ok(Self {
             runtime,
             log_queue,
             controller,
             _factory: factory,
+            _preflight_factory: preflight_factory,
             epoch: Instant::now(),
         })
     }

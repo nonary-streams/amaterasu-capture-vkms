@@ -1,4 +1,5 @@
 //! Caller-scoped capture streams for owned `kwin:Virtual-N` outputs.
+mod preflight;
 use crate::{
     backend::Backend,
     discovery::OutputBinding,
@@ -514,5 +515,7 @@ fn stream_reply(id: u64, stream: &Stream) -> Value {
     reply
 }
 
+#[cfg(test)]
+mod preflight_tests;
 #[cfg(test)]
 mod tests;

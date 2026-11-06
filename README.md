@@ -10,7 +10,35 @@ This is experimental source; a build alone does not qualify a deployment. Native
 - `helper-wire/` builds the shared helper protocol library and the restricted `amaterasu-vkms-frame-helper` binary. The broker and installation/authorization policy remain separate; deploying the binary requires a compatible broker and explicit operator authorization.
 - `capture/protocols/xdg-output-unstable-v1.xml` is third-party protocol material and retains its copyright and permission notice.
 
-The capture and helper sources were extracted from Amaterasu commit `50570c3a757d9673eb7ada19a60124e2da6a2c74`. The initial extraction preserved the production source from that revision; one test queues its simulated export failure before waking the presenter to avoid a test race. The provider pins SDK revision `a3268d5db84bee3ae5181aae327d8e0bfab3fbb5`, a draft revision that includes the DMA-BUF lease API.
+The capture and helper sources were extracted from Amaterasu commit `50570c3a757d9673eb7ada19a60124e2da6a2c74`. The initial extraction preserved the production source from that revision; one test queues its simulated export failure before waking the presenter to avoid a test race. The provider pins reviewed SDK revision `a5ed264bcb06880204f2ee24bb3e7ede425fafff`, exported from Amaterasu `097d85ed93c6f0b5079631c58c789cf55df622a9`. This includes the typed Capture family and optional v1.11 source-preflight API.
+
+## Read-only source preflight
+
+The selected Capture service implements the public SDK's optional v1.11 query.
+Its managed-output check verifies current capture permission, the protected
+authority approval and immutable helper, read-only KMS availability, and the
+compiled source format/snapshot path. An exact selector also requires the same
+active source mode. A class query permits disconnected connector pools so a
+future managed display need not already exist. Neither query opens a helper
+session, exports frame descriptors, starts a capture/presenter worker, or
+changes displays. A ready answer proves no ownership and reserves no resource;
+normal open and per-presentation provenance checks remain mandatory.
+
+The protected launcher must support the separate PRECHECK protocol and the host
+must inject `authority_precheck_supported` for that adopted root-peer channel.
+Old launchers return unsupported before any unknown opcode is sent. The legacy
+helper executable path has no pure readiness operation and is unsupported for
+preflight; the provider never starts it as a query fallback. The HDR/high-depth
+capability requires the real guarded color path (`driver-read-leases` plus
+`require_lease`), and requested GPU snapshots require the compiled adapter.
+
+The reviewed SDK revision is a local candidate and has not been published.
+To validate it without changing portable GitHub dependency URLs or shared Cargo
+caches, import the reviewed SDK bundle into an independent local Git repository
+and run `sh tools/validate-local-sdk.sh /absolute/path/to/reviewed-sdk.git`.
+The helper verifies the exact pinned commit and uses an isolated Cargo home,
+command-scoped Git URL rewriting, and build output under this checkout's target
+directory. It does not edit cached source or publish either repository.
 
 ## Local validation
 

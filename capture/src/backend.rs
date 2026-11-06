@@ -24,6 +24,9 @@ pub trait Backend: Send {
     fn resolve(&self, output: OutputName) -> CaptureResult<OutputBinding>;
     /// Starts the helper once to prove it is usable and holds CAP_SYS_ADMIN.
     fn probe_helper(&self, helper: HelperEndpoint<'_>) -> CaptureResult<()>;
+    /// Recheck approval without starting a helper or creating a source/session.
+    fn preflight_helper(&self, helper: HelperEndpoint<'_>) -> CaptureResult<()>;
+    fn preflight_mode(&self, width: u32, height: u32) -> CaptureResult<()>;
     /// Starts a helper for `binding`, opens its card and exports one frame
     /// to prove the whole path works before a stream is reported open.
     fn connect(
@@ -73,6 +76,38 @@ impl Backend for NativeBackend {
 
     fn probe_helper(&self, helper: HelperEndpoint<'_>) -> CaptureResult<()> {
         start_helper(helper).map(drop)
+    }
+
+    fn preflight_helper(&self, helper: HelperEndpoint<'_>) -> CaptureResult<()> {
+        let HelperEndpoint::ApprovedChannel(raw) = helper else {
+            return Err(CaptureError::code("legacy_preflight_unsupported"));
+        };
+        // SAFETY: fcntl validates the numeric descriptor without assuming a
+        // valid borrowed fd from settings. This duplicates only the existing
+        // control channel; no capture session or source descriptor is opened.
+        let duplicate = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 {
+            return Err(CaptureError::code("authority_unavailable"));
+        }
+        // SAFETY: fcntl returned one new descriptor owned exclusively here.
+        let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        amaterasu_vkms_frame_helper::authority::precheck_authorized(duplicate.as_fd()).map_err(
+            |error| {
+                CaptureError::code(if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    "authority_denied"
+                } else {
+                    "authority_precheck_unavailable"
+                })
+            },
+        )
+    }
+
+    fn preflight_mode(&self, width: u32, height: u32) -> CaptureResult<()> {
+        if self.probe.supports_mode(width, height) {
+            Ok(())
+        } else {
+            Err(CaptureError::code("source_mode_unavailable"))
+        }
     }
 
     fn connect(

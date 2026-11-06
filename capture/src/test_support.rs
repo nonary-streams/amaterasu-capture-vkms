@@ -332,6 +332,8 @@ pub fn connector(index: u32, crtc_id: u32, width: u32) -> ConnectorState {
 
 /// A backend over a mutable list of connectors on card3.
 pub struct FakeBackend {
+    pub pure_prechecks: Arc<std::sync::atomic::AtomicUsize>,
+    pub helper_starts: Arc<std::sync::atomic::AtomicUsize>,
     pub connectors: Arc<Mutex<Result<Vec<ConnectorState>, CaptureError>>>,
     pub helper: Arc<Mutex<CaptureResult<()>>>,
     pub script: Arc<SourceScript>,
@@ -374,6 +376,8 @@ pub fn appended_layout(virtual_9_width: u32) -> Vec<LayoutOutput> {
 impl FakeBackend {
     pub fn new() -> Self {
         Self {
+            pure_prechecks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            helper_starts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             connectors: Arc::new(Mutex::new(Ok(vec![
                 connector(9, 41, 1920),
                 connector(10, 42, 1920),
@@ -388,6 +392,8 @@ impl FakeBackend {
 
     pub fn handles(&self) -> Self {
         Self {
+            pure_prechecks: self.pure_prechecks.clone(),
+            helper_starts: self.helper_starts.clone(),
             connectors: self.connectors.clone(),
             helper: self.helper.clone(),
             script: self.script.clone(),
@@ -424,7 +430,28 @@ impl Backend for FakeBackend {
     }
 
     fn probe_helper(&self, _helper: HelperEndpoint<'_>) -> CaptureResult<()> {
+        self.helper_starts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.helper.lock().unwrap().clone()
+    }
+
+    fn preflight_helper(&self, helper: HelperEndpoint<'_>) -> CaptureResult<()> {
+        self.pure_prechecks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match helper {
+            HelperEndpoint::ApprovedChannel(_) => self.helper.lock().unwrap().clone(),
+            HelperEndpoint::Executable(_) => {
+                Err(CaptureError::code("legacy_preflight_unsupported"))
+            }
+        }
+    }
+
+    fn preflight_mode(&self, width: u32, height: u32) -> CaptureResult<()> {
+        if width <= 8192 && height <= 8192 {
+            Ok(())
+        } else {
+            Err(CaptureError::code("source_mode_unavailable"))
+        }
     }
 
     fn connect(

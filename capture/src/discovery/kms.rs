@@ -131,6 +131,33 @@ impl KmsProbe {
             sysfs_root: PathBuf::from(sysfs::DRM_SYSFS_ROOT),
         }
     }
+
+    /// Inspect cached KMS geometry limits without a capture/export or modeset.
+    /// A future managed output need not have an active CRTC yet.
+    pub fn supports_mode(&self, width: u32, height: u32) -> bool {
+        self.sysfs_cards().ok().is_some_and(|cards| {
+            cards.iter().any(|card| {
+                let Ok(device) = drm_node::open_vibeshine_node(card.device, Access::ReadOnly)
+                else {
+                    return false;
+                };
+                let mut limits = CardResources::default();
+                // SAFETY: all list pointers/counts are zero; GETRESOURCES only
+                // returns counts and the driver's cached min/max geometry.
+                unsafe { ioctl_record(&device, DRM_IOCTL_MODE_GETRESOURCES, &mut limits) }.is_ok()
+                    && within_limits(&limits, width, height)
+            })
+        })
+    }
+}
+
+fn within_limits(limits: &CardResources, width: u32, height: u32) -> bool {
+    limits.max_width > 0
+        && limits.max_height > 0
+        && limits.min_width <= width
+        && width <= limits.max_width
+        && limits.min_height <= height
+        && height <= limits.max_height
 }
 
 impl DisplayProbe for KmsProbe {
@@ -251,6 +278,19 @@ fn crtc_state(crtc: &GetCrtc) -> CrtcState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_preflight_requires_current_kms_geometry_limits() {
+        let mut limits = CardResources::default();
+        assert!(!within_limits(&limits, 1920, 1080));
+        limits.min_width = 16;
+        limits.min_height = 16;
+        limits.max_width = 3840;
+        limits.max_height = 2160;
+        assert!(within_limits(&limits, 1920, 1080));
+        assert!(!within_limits(&limits, 8192, 2160));
+        assert!(!within_limits(&limits, 1920, 8));
+    }
 
     #[test]
     #[cfg(target_pointer_width = "64")]

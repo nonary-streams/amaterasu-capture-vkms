@@ -418,7 +418,9 @@ fn close_stops_the_presentation_thread_promptly() {
     assert_eq!(backend.script.waits.lock().unwrap().len(), waits);
     // The last frame closes when the stream's state is released.
     drop(frames);
-    assert!(backend.script.all_lent_descriptors_closed());
+    // Presenter retirement is asynchronous; let its final admitted stack
+    // reference retire before asserting descriptor closure under parallel load.
+    assert!(eventually(|| backend.script.all_lent_descriptors_closed()));
 }
 
 #[test]

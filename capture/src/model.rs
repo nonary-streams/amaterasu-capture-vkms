@@ -63,6 +63,9 @@ pub struct Settings {
     /// the inherited descriptor after the protected launcher authenticated it.
     pub authority_channel: bool,
     pub authority_channel_fd: Option<i32>,
+    /// Injected by the host only when the protected launcher selected the
+    /// precheck-aware worker protocol. Old launchers fail before any opcode.
+    pub authority_precheck_supported: bool,
     /// Copies scanout into independent GPU storage before advertising leases.
     pub gpu_snapshot: bool,
     /// Require immutable leases backed by a protected GPU snapshot. Never lend
@@ -85,6 +88,7 @@ impl Settings {
         if !helper_valid
             || !valid_principals(&self.capture_principals)
             || (self.authority_channel && self.frame_helper.is_some())
+            || (self.authority_precheck_supported && !self.authority_channel)
             || self
                 .authority_channel_fd
                 .is_some_and(|fd| !self.authority_channel || fd < 3)
