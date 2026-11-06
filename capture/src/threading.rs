@@ -3,9 +3,17 @@
 //! this provider remains independently buildable against its existing SDK pin.
 mod linux;
 
+/// Vibeshine's critical streaming level. Installations without CAP_SYS_NICE
+/// receive the strongest level their RLIMIT_NICE permits.
+const CRITICAL_NICE: i32 = -15;
+
 pub fn configure_capture_thread() {
-    if let Err(error) = linux::set(-15) {
-        eprintln!("VKMS capture thread critical priority unavailable: {error}");
+    match linux::raise_toward(CRITICAL_NICE) {
+        Ok(applied) if applied != CRITICAL_NICE => {
+            eprintln!("VKMS capture thread priority limited to nice {applied} by RLIMIT_NICE");
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("VKMS capture thread critical priority unavailable: {error}"),
     }
 }
 
@@ -17,14 +25,15 @@ pub struct ScopedCapturePriority {
 }
 impl ScopedCapturePriority {
     pub fn enter() -> Self {
-        let previous =
-            match linux::current().and_then(|previous| linux::set(-15).map(|()| previous)) {
-                Ok(previous) => Some(previous),
-                Err(error) => {
-                    eprintln!("capture helper priority unavailable: {error}");
-                    None
-                }
-            };
+        let previous = match linux::current()
+            .and_then(|previous| linux::raise_toward(CRITICAL_NICE).map(|_| previous))
+        {
+            Ok(previous) => Some(previous),
+            Err(error) => {
+                eprintln!("capture helper priority unavailable: {error}");
+                None
+            }
+        };
         Self {
             previous,
             _same_thread: std::marker::PhantomData,

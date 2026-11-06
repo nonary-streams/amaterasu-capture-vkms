@@ -1,6 +1,8 @@
 //! Linux capability changes are thread-local and scoped to one setpriority call.
 //! Only an already permitted CAP_SYS_NICE may be made effective. The exact
 //! previous capability sets are restored before returning, including on failure.
+//! Without that capability, a raise falls back to the strongest level the
+//! thread's RLIMIT_NICE already permits; no limit or capability is granted.
 use std::io;
 
 #[repr(C)]
@@ -65,6 +67,52 @@ pub(super) fn set(priority: i32) -> io::Result<()> {
         },
         || set_nice(priority),
     )
+}
+
+/// Raises the calling thread toward `requested`, returning the nice level
+/// actually applied. When neither `requested` nor CAP_SYS_NICE is permitted,
+/// the strongest level allowed by RLIMIT_NICE is used instead. A thread that
+/// cannot be raised at all reports the original permission error.
+pub(super) fn raise_toward(requested: i32) -> io::Result<i32> {
+    let denied = match set(requested) {
+        Ok(()) => return Ok(requested),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => error,
+        Err(error) => return Err(error),
+    };
+    let current = current()?;
+    let Some(permitted) = permitted_nice(requested, rlimit_nice_floor()?, current) else {
+        return Err(denied);
+    };
+    if permitted < current {
+        set_nice(permitted)?;
+    }
+    Ok(permitted)
+}
+
+/// The lowest nice value RLIMIT_NICE lets an unprivileged thread select:
+/// `20 - rlim_cur`, as defined by setrlimit(2).
+fn rlimit_nice_floor() -> io::Result<i32> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes one rlimit through this valid, exclusive pointer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NICE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(nice_floor(limit.rlim_cur))
+}
+
+fn nice_floor(soft_limit: libc::rlim_t) -> i32 {
+    // Values above 40 (including RLIM_INFINITY) permit the strongest level.
+    20 - soft_limit.min(40) as i32
+}
+
+/// The strongest permitted level, unless the limit cannot even keep the
+/// current level (an inherited level stronger than the limit is not raised).
+fn permitted_nice(requested: i32, floor: i32, current: i32) -> Option<i32> {
+    let permitted = requested.max(floor);
+    (permitted <= current).then_some(permitted)
 }
 
 fn with_permitted_nice(
@@ -172,6 +220,21 @@ mod tests {
         assert!(failed.is_err());
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[1], previous);
+    }
+    #[test]
+    fn rlimit_nice_maps_to_the_documented_floor() {
+        assert_eq!(nice_floor(0), 20);
+        assert_eq!(nice_floor(31), -11);
+        assert_eq!(nice_floor(40), -20);
+        assert_eq!(nice_floor(libc::RLIM_INFINITY), -20);
+    }
+    #[test]
+    fn denied_raise_uses_the_strongest_level_rlimit_permits() {
+        assert_eq!(permitted_nice(-15, -11, 0), Some(-11));
+        assert_eq!(permitted_nice(-10, -11, 0), Some(-10));
+        assert_eq!(permitted_nice(-15, -11, -11), Some(-11));
+        assert_eq!(permitted_nice(-15, 20, 0), None);
+        assert_eq!(permitted_nice(-15, -11, -12), None);
     }
     #[test]
     fn missing_permitted_capability_does_not_attempt_to_grant_it() {
