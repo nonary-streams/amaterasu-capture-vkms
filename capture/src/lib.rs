@@ -43,6 +43,16 @@ use std::{
 const SERVICE: &str = "amaterasu.capture-vkms/1";
 const REQUESTS_PER_TICK: usize = 8;
 
+/// Package composition may request the reserved false settings placeholder
+/// only when the selected artifact supports that field. This marker establishes
+/// schema/protocol support, not native admission or source readiness; those
+/// still require the adopted v2 root-peer channel and actual PRECHECK.
+#[used]
+#[unsafe(no_mangle)]
+pub static AMATERASU_CAPTURE_AUTHORITY_PRECHECK_CAPABILITY: [u8;
+    b"AMATERASU_CAPTURE_AUTHORITY_PRECHECK=1\0".len()] =
+    *b"AMATERASU_CAPTURE_AUTHORITY_PRECHECK=1\0";
+
 struct VkmsPreflight(native::Shared<NativeBackend>);
 impl SourcePreflightProvider for VkmsPreflight {
     fn query(

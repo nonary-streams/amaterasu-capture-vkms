@@ -32,6 +32,14 @@ preflight; the provider never starts it as a query fallback. The HDR/high-depth
 capability requires the real guarded color path (`driver-read-leases` plus
 `require_lease`), and requested GPU snapshots require the compiled adapter.
 
+New package composition can opt in with `--capture-authority-precheck` together
+with `--capture-authority-helper`. Its pack and service checks require this
+artifact's exact `AMATERASU_CAPTURE_AUTHORITY_PRECHECK=1` NUL-terminated marker
+before emitting/using the false settings placeholder. Older profiles omit the
+field, preserving older strict settings schemas. The marker proves support for
+the requested configuration/protocol only; it does not grant capture authority,
+admit a native resource, or claim actual readiness.
+
 The reviewed SDK revision is a local candidate and has not been published.
 To validate it without changing portable GitHub dependency URLs or shared Cargo
 caches, import the reviewed SDK bundle into an independent local Git repository
