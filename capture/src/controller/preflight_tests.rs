@@ -107,3 +107,31 @@ fn old_protected_launcher_is_rejected_without_sending_an_unknown_opcode() {
     assert_eq!(handles.helper_starts.load(Ordering::SeqCst), 0);
     assert!(handles.connects.lock().unwrap().is_empty());
 }
+
+#[test]
+fn old_launcher_native_channel_receives_zero_query_bytes() {
+    use std::os::fd::{AsFd, AsRawFd};
+    let (client, server) = amaterasu_vkms_frame_helper::channel::SeqpacketChannel::pair().unwrap();
+    server
+        .set_receive_timeout(Some(std::time::Duration::from_millis(1)))
+        .unwrap();
+    let mut config = approved();
+    config.authority_precheck_supported = false;
+    config.authority_channel_fd = Some(client.as_fd().as_raw_fd());
+    let controller = Controller::new(crate::backend::NativeBackend::new(), config);
+    assert_eq!(
+        controller
+            .preflight("amaterasu.video", &request(None))
+            .reason
+            .as_deref(),
+        Some("authority_precheck_unsupported")
+    );
+    let error = server.receive(&mut [0; 9]).err().unwrap();
+    assert!(
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "the live old control conversation remains untouched"
+    );
+}
