@@ -7,10 +7,22 @@
 use crate::{channel::SeqpacketChannel, client::HelperClient};
 use std::{io, os::fd::BorrowedFd, sync::Mutex, time::Duration};
 
+mod retirement;
+pub use retirement::{
+    RetirementReceipt, RetiringHelperClient, connect_authorized_retiring,
+    precheck_retiring_authorized,
+};
+
 pub const AUTHORITY_OPEN_SESSION: &[u8; 8] = b"AMACA001";
 pub const AUTHORITY_SESSION_READY: &[u8; 8] = b"AMACAOK1";
 pub const AUTHORITY_SESSION_DENIED: &[u8; 8] = b"AMACANO1";
 pub const AUTHORITY_PRECHECK: &[u8; 8] = b"AMACAP01";
+pub const AUTHORITY_OPEN_RETIRING_SESSION: &[u8; 8] = b"AMACA002";
+pub const AUTHORITY_RETIRING_SESSION_READY: &[u8; 8] = b"AMACAOK2";
+pub const AUTHORITY_PRECHECK_RETIREMENT: &[u8; 8] = b"AMACAP02";
+pub const AUTHORITY_RETIREMENT_SUPPORTED: &[u8; 8] = b"AMACP2OK";
+pub const AUTHORITY_SESSION_RETIRED: &[u8; 8] = b"AMACADN2";
+pub const AUTHORITY_RETIREMENT_FAILED: &[u8; 8] = b"AMACAER2";
 pub const AUTHORITY_PRECHECK_READY: &[u8; 8] = b"AMACAPOK";
 
 // Every stream duplicates the same inherited socket. Serialize the complete

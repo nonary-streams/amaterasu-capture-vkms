@@ -66,6 +66,40 @@ pub struct SourceScript {
     /// Models a helper stuck in the driver: interrupts are ignored and a
     /// WAIT returns only at its timeout.
     pub ignore_interrupts: AtomicBool,
+    /// Sources whose owning presentation thread has actually retired.
+    pub source_drops: std::sync::atomic::AtomicUsize,
+    pub source_drop_gate: Mutex<Option<Arc<SourceDropGate>>>,
+    pub panic_on_source_drop: AtomicBool,
+    pub retirement: Mutex<Option<Arc<dyn crate::retirement::Retirement>>>,
+}
+
+#[derive(Default)]
+pub struct SourceDropGate {
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+impl SourceDropGate {
+    pub fn entered(&self) -> bool {
+        self.state.lock().unwrap().0
+    }
+
+    pub fn release(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.changed.notify_all();
+    }
+
+    fn wait(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.0 = true;
+        self.changed.notify_all();
+        // A broken blocking caller still terminates in finite time and cannot
+        // strand the test process if an assertion prevents explicit release.
+        let _ = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(1), |state| !state.1)
+            .unwrap();
+    }
 }
 
 impl SourceScript {
@@ -206,6 +240,19 @@ pub struct FakeSource {
     interrupt: Arc<FakeInterrupt>,
 }
 
+impl Drop for FakeSource {
+    fn drop(&mut self) {
+        if let Some(gate) = self.script.source_drop_gate.lock().unwrap().clone() {
+            gate.wait();
+        }
+        assert!(
+            !self.script.panic_on_source_drop.load(Ordering::SeqCst),
+            "synthetic source retirement failure"
+        );
+        self.script.source_drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 impl FakeSource {
     pub fn new(script: Arc<SourceScript>) -> Self {
         Self {
@@ -224,6 +271,9 @@ impl FakeSource {
 }
 
 impl FrameSource for FakeSource {
+    fn retirement(&self) -> Option<Arc<dyn crate::retirement::Retirement>> {
+        self.script.retirement.lock().unwrap().clone()
+    }
     fn wait(
         &mut self,
         crtc_id: u32,

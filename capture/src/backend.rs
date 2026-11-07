@@ -1,11 +1,15 @@
 //! The platform operations the controller needs, behind one trait so the
 //! controller is testable without DRM or a helper process.
+mod authority;
+#[cfg(test)]
+mod retirement_tests;
 use crate::{
     discovery::{self, Discovery, DisplayProbe, OutputBinding, kms::KmsProbe},
     geometry::{DesktopLayout, LayoutOutput, WaylandLayout},
     model::{CaptureError, CaptureResult, HelperEndpoint},
     output_name::OutputName,
     presenter::{FrameSource, SourceInterrupt},
+    retirement::{Registry, Retirement},
 };
 use amaterasu_vkms_frame_helper::{
     channel::ChannelShutdown,
@@ -20,6 +24,9 @@ use std::{
 };
 
 pub trait Backend: Send {
+    fn poll_retirement(&self) -> CaptureResult<bool> {
+        Ok(true)
+    }
     fn discover(&self) -> CaptureResult<Discovery>;
     fn resolve(&self, output: OutputName) -> CaptureResult<OutputBinding>;
     /// Starts the helper once to prove it is usable and holds CAP_SYS_ADMIN.
@@ -46,6 +53,8 @@ pub trait Backend: Send {
 pub struct NativeBackend {
     probe: KmsProbe,
     layout: Mutex<WaylandLayout>,
+    retirements: Arc<Registry>,
+    authority: Box<dyn authority::AuthorityConnector>,
 }
 
 impl NativeBackend {
@@ -53,6 +62,8 @@ impl NativeBackend {
         Self {
             probe: KmsProbe::new(),
             layout: Mutex::new(WaylandLayout::new()),
+            retirements: Arc::new(Registry::default()),
+            authority: Box::new(authority::NativeAuthority),
         }
     }
 
@@ -66,6 +77,9 @@ impl NativeBackend {
 }
 
 impl Backend for NativeBackend {
+    fn poll_retirement(&self) -> CaptureResult<bool> {
+        self.retirements.poll_retired()
+    }
     fn discover(&self) -> CaptureResult<Discovery> {
         discovery::discover(&self.probe as &dyn DisplayProbe)
     }
@@ -75,7 +89,7 @@ impl Backend for NativeBackend {
     }
 
     fn probe_helper(&self, helper: HelperEndpoint<'_>) -> CaptureResult<()> {
-        start_helper(helper).map(drop)
+        self.start_helper(helper).map(drop)
     }
 
     fn preflight_helper(&self, helper: HelperEndpoint<'_>) -> CaptureResult<()> {
@@ -91,15 +105,14 @@ impl Backend for NativeBackend {
         }
         // SAFETY: fcntl returned one new descriptor owned exclusively here.
         let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
-        amaterasu_vkms_frame_helper::authority::precheck_authorized(duplicate.as_fd()).map_err(
-            |error| {
-                CaptureError::code(if error.kind() == std::io::ErrorKind::PermissionDenied {
-                    "authority_denied"
-                } else {
-                    "authority_precheck_unavailable"
+        amaterasu_vkms_frame_helper::authority::precheck_retiring_authorized(duplicate.as_fd())
+            .map_err(|error| {
+                CaptureError::code(match error.kind() {
+                    std::io::ErrorKind::PermissionDenied => "authority_denied",
+                    std::io::ErrorKind::Unsupported => "authority_retirement_unsupported",
+                    _ => "authority_precheck_unavailable",
                 })
-            },
-        )
+            })
     }
 
     fn preflight_mode(&self, width: u32, height: u32) -> CaptureResult<()> {
@@ -115,7 +128,7 @@ impl Backend for NativeBackend {
         helper: HelperEndpoint<'_>,
         binding: &OutputBinding,
     ) -> CaptureResult<Box<dyn FrameSource>> {
-        let mut process = start_helper(helper)?;
+        let mut process = self.start_helper(helper)?;
         process
             .client()
             .open_card(binding.device.major, binding.device.minor)
@@ -180,6 +193,9 @@ struct HelperSource {
 }
 
 impl FrameSource for HelperSource {
+    fn retirement(&self) -> Option<Arc<dyn Retirement>> {
+        Some(self.process.retirement())
+    }
     fn holds_producer(&self) -> bool {
         cfg!(feature = "driver-read-leases")
     }
@@ -220,91 +236,111 @@ impl SourceInterrupt for ChannelShutdown {
 /// Verifies, spawns and greets the helper; refuses one without CAP_SYS_ADMIN.
 enum HelperConnection {
     Legacy(HelperProcess),
-    Approved(HelperClient),
+    Approved(Box<dyn authority::ApprovedSession>),
 }
 
 impl HelperConnection {
     fn client(&mut self) -> &mut HelperClient {
         match self {
             Self::Legacy(process) => process.client(),
-            Self::Approved(client) => client,
+            Self::Approved(session) => session.client(),
+        }
+    }
+
+    fn retirement(&self) -> Arc<dyn Retirement> {
+        match self {
+            Self::Legacy(process) => process.retirement_receipt(),
+            Self::Approved(session) => session.retirement(),
         }
     }
 }
 
-fn start_helper(helper: HelperEndpoint<'_>) -> CaptureResult<HelperConnection> {
-    let mut connection = match helper {
-        HelperEndpoint::Executable(path) => {
-            let _priority = crate::threading::ScopedCapturePriority::enter();
-            let executable = process::open_verified_helper(Path::new(path))
-                .map_err(|problem| CaptureError::frame_helper_unavailable(problem.describe()))?;
-            HelperConnection::Legacy(HelperProcess::spawn(executable).map_err(|error| {
-                CaptureError::frame_helper_unavailable(format!(
-                    "cannot start the frame helper: {error}"
-                ))
-            })?)
-        }
-        HelperEndpoint::ApprovedChannel(raw) => {
-            // fcntl validates the untrusted numeric descriptor and returns a new
-            // owned descriptor; constructing BorrowedFd directly from policy
-            // would assume a validity guarantee the policy cannot provide.
-            // SAFETY: F_DUPFD_CLOEXEC operates only on this process's fd table.
-            let duplicate = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 3) };
-            if duplicate < 0 {
-                return Err(CaptureError::new(
-                    "authority_unavailable",
-                    "the inherited capture authority channel is closed",
-                ));
-            }
-            // SAFETY: successful fcntl returned a new descriptor owned here.
-            let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
-            let client =
-                amaterasu_vkms_frame_helper::authority::connect_authorized(duplicate.as_fd())
-                    .map_err(|error| {
-                        CaptureError::new(
-                            if error.kind() == std::io::ErrorKind::PermissionDenied {
-                                "authority_denied"
-                            } else {
-                                "authority_unavailable"
-                            },
-                            format!("cannot obtain package-approved capture session: {error}"),
-                        )
+impl Retirement for process::ProcessRetirementReceipt {
+    fn poll_retired(&self) -> std::io::Result<bool> {
+        Self::poll_retired(self)
+    }
+}
+
+impl NativeBackend {
+    fn start_helper(&self, helper: HelperEndpoint<'_>) -> CaptureResult<HelperConnection> {
+        let _ = self.retirements.poll_retired();
+        let reservation = self.retirements.reserve()?;
+        let mut connection = match helper {
+            HelperEndpoint::Executable(path) => {
+                let _priority = crate::threading::ScopedCapturePriority::enter();
+                let executable =
+                    process::open_verified_helper(Path::new(path)).map_err(|problem| {
+                        CaptureError::frame_helper_unavailable(problem.describe())
                     })?;
-            HelperConnection::Approved(client)
-        }
-    };
-    let hello = match connection.client().hello() {
-        Ok(hello) => hello,
-        Err(ClientError::Closed) => {
-            let reason = match &mut connection {
-                HelperConnection::Legacy(process) => process.startup_refusal(),
-                HelperConnection::Approved(_) => {
-                    "the capture authority session was denied or revoked".into()
+                HelperConnection::Legacy(HelperProcess::spawn(executable).map_err(|error| {
+                    CaptureError::frame_helper_unavailable(format!(
+                        "cannot start the frame helper: {error}"
+                    ))
+                })?)
+            }
+            HelperEndpoint::ApprovedChannel(raw) => {
+                // fcntl validates the untrusted numeric descriptor and returns a new
+                // owned descriptor; constructing BorrowedFd directly from policy
+                // would assume a validity guarantee the policy cannot provide.
+                // SAFETY: F_DUPFD_CLOEXEC operates only on this process's fd table.
+                let duplicate = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 3) };
+                if duplicate < 0 {
+                    return Err(CaptureError::new(
+                        "authority_unavailable",
+                        "the inherited capture authority channel is closed",
+                    ));
                 }
-            };
+                // SAFETY: successful fcntl returned a new descriptor owned here.
+                let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
+                let client = self.authority.connect(duplicate.as_fd()).map_err(|error| {
+                    CaptureError::new(
+                        match error.kind() {
+                            std::io::ErrorKind::PermissionDenied => "authority_denied",
+                            std::io::ErrorKind::Unsupported => "authority_retirement_unsupported",
+                            _ => "authority_unavailable",
+                        },
+                        format!("cannot obtain package-approved capture session: {error}"),
+                    )
+                })?;
+                HelperConnection::Approved(client)
+            }
+        };
+        // V2 authority handoff cannot spawn a privileged helper until HELLO. Keep
+        // its receipt (or the legacy owned reaper) before any fallible protocol work.
+        reservation.attach(connection.retirement());
+        let hello = match connection.client().hello() {
+            Ok(hello) => hello,
+            Err(ClientError::Closed) => {
+                let reason = match &mut connection {
+                    HelperConnection::Legacy(process) => process.startup_refusal(),
+                    HelperConnection::Approved(_) => {
+                        "the capture authority session was denied or revoked".into()
+                    }
+                };
+                return Err(match helper {
+                    HelperEndpoint::ApprovedChannel(_) => {
+                        CaptureError::new("authority_unavailable", reason)
+                    }
+                    _ => CaptureError::frame_helper_unavailable(reason),
+                });
+            }
+            Err(error) => {
+                return Err(CaptureError::frame_helper_unavailable(format!(
+                    "the frame helper did not answer: {error:?}"
+                )));
+            }
+        };
+        if !hello.admin_permitted {
             return Err(match helper {
-                HelperEndpoint::ApprovedChannel(_) => {
-                    CaptureError::new("authority_unavailable", reason)
-                }
-                _ => CaptureError::frame_helper_unavailable(reason),
+                HelperEndpoint::Executable(path) => CaptureError::permission_denied(path),
+                HelperEndpoint::ApprovedChannel(_) => CaptureError::new(
+                    "authority_denied",
+                    "package-approved capture authority is unavailable or revoked",
+                ),
             });
         }
-        Err(error) => {
-            return Err(CaptureError::frame_helper_unavailable(format!(
-                "the frame helper did not answer: {error:?}"
-            )));
-        }
-    };
-    if !hello.admin_permitted {
-        return Err(match helper {
-            HelperEndpoint::Executable(path) => CaptureError::permission_denied(path),
-            HelperEndpoint::ApprovedChannel(_) => CaptureError::new(
-                "authority_denied",
-                "package-approved capture authority is unavailable or revoked",
-            ),
-        });
+        Ok(connection)
     }
-    Ok(connection)
 }
 
 pub fn open_card_error(binding: &OutputBinding, error: &ClientError) -> CaptureError {
@@ -398,7 +434,8 @@ mod tests {
 
     #[test]
     fn a_missing_approved_channel_is_unavailable_without_a_legacy_fallback() {
-        let error = start_helper(HelperEndpoint::ApprovedChannel(i32::MAX))
+        let error = NativeBackend::new()
+            .start_helper(HelperEndpoint::ApprovedChannel(i32::MAX))
             .err()
             .unwrap();
         assert_eq!(error.code, "authority_unavailable");
@@ -451,7 +488,8 @@ mod tests {
     #[test]
     fn an_unusable_helper_path_is_frame_helper_unavailable() {
         for path in ["relative/helper", "/nonexistent/amaterasu-helper", "/"] {
-            let error = start_helper(HelperEndpoint::Executable(path))
+            let error = NativeBackend::new()
+                .start_helper(HelperEndpoint::Executable(path))
                 .err()
                 .unwrap();
             assert_eq!(error.code, "frame_helper_unavailable", "{path}");

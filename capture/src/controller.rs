@@ -1,6 +1,9 @@
 //! Caller-scoped capture streams for owned `kwin:Virtual-N` outputs.
+#[cfg(test)]
+mod module_tests;
 mod preflight;
 use crate::{
+    admission::Admission,
     backend::Backend,
     discovery::OutputBinding,
     frames::{StreamFault, StreamFrames},
@@ -58,6 +61,7 @@ struct Stream {
     presenter: PresentationThread,
     authoritative_color: bool,
     next_resolve_ms: u64,
+    closing: bool,
 }
 
 pub struct Reply {
@@ -101,13 +105,16 @@ impl Availability {
 }
 
 pub struct Controller<B: Backend> {
-    backend: B,
     logger: Option<LogEmitter>,
     settings: Settings,
     streams: BTreeMap<u64, Stream>,
     closed: BTreeMap<u64, String>,
     opened: u64,
     last_availability: Option<Availability>,
+    retiring_admissions: Vec<Arc<Admission>>,
+    // Rust drops fields in declaration order. Source workers must stop before
+    // the backend's last owned legacy-reaper receipts perform final containment.
+    backend: B,
 }
 
 impl<B: Backend> Controller<B> {
@@ -128,6 +135,7 @@ impl<B: Backend> Controller<B> {
             closed: BTreeMap::new(),
             opened: 0,
             last_availability: None,
+            retiring_admissions: Vec::new(),
         }
     }
 
@@ -159,7 +167,9 @@ impl<B: Backend> Controller<B> {
                     .ok_or_else(|| CaptureError::code("not_found"))
             }
             Operation::Close { stream } => {
-                self.close(caller, stream)?;
+                if !self.close(caller, stream)? {
+                    return Err(CaptureError::code("capture_close_pending"));
+                }
                 Ok(Reply::existing(json!({"ok":true})))
             }
         }
@@ -197,6 +207,9 @@ impl<B: Backend> Controller<B> {
         if let Some((id, existing)) = self.find_operation(caller, &operation) {
             if existing.binding.output != name {
                 return Err(CaptureError::code("operation_conflict"));
+            }
+            if existing.closing {
+                return Err(CaptureError::code("capture_closing"));
             }
             return Ok(Reply::existing(stream_reply(id, existing)));
         }
@@ -245,6 +258,7 @@ impl<B: Backend> Controller<B> {
             presenter,
             authoritative_color,
             next_resolve_ms: now + RESOLVE_INTERVAL_MS,
+            closing: false,
         };
         let payload = stream_reply(id, &stream);
         self.streams.insert(id, stream);
@@ -282,7 +296,7 @@ impl<B: Backend> Controller<B> {
         let stream = self
             .streams
             .get(&stream)
-            .filter(|stream| stream.owner == caller)
+            .filter(|stream| stream.owner == caller && !stream.closing)
             .ok_or_else(|| CaptureError::code("not_found"))?;
         Ok(Reader {
             frames: stream.frames.clone(),
@@ -291,9 +305,9 @@ impl<B: Backend> Controller<B> {
         })
     }
 
-    pub fn close(&mut self, caller: &str, id: u64) -> CaptureResult<()> {
+    pub fn close(&mut self, caller: &str, id: u64) -> CaptureResult<bool> {
         if self.closed.get(&id).is_some_and(|owner| owner == caller) {
-            return Ok(());
+            return Ok(true);
         }
         if !self
             .streams
@@ -302,18 +316,31 @@ impl<B: Backend> Controller<B> {
         {
             return Err(CaptureError::code("not_found"));
         }
-        self.end_stream(id);
-        Ok(())
+        let stream = self.streams.get_mut(&id).expect("authorized stream exists");
+        stream.closing = true;
+        stream.frames.admission.close();
+        if !stream
+            .presenter
+            .poll_stop()
+            .map_err(|message| CaptureError::new("capture_retirement_failed", message))?
+        {
+            return Ok(false);
+        }
+        self.finish_stream(id);
+        Ok(true)
     }
 
-    /// Stops admitting native reads, then stops the presentation thread,
-    /// which ends the helper. A read admitted before close keeps the stored
-    /// frame alive until it ends.
-    fn end_stream(&mut self, id: u64) {
-        if let Some(mut stream) = self.streams.remove(&id) {
-            stream.frames.admission.close();
-            stream.presenter.stop();
-            stream.frames.events.close("stream_closed");
+    /// Called only after the worker has joined. Existing admitted reads and
+    /// retained leases keep their exact storage; metadata retains no mailbox FD.
+    fn finish_stream(&mut self, id: u64) {
+        if let Some(stream) = self.streams.remove(&id) {
+            stream.frames.close();
+            self.retiring_admissions
+                .retain(|admission| !admission.is_idle());
+            if !stream.frames.admission.is_idle() {
+                self.retiring_admissions
+                    .push(stream.frames.admission.clone());
+            }
             self.closed.insert(id, stream.owner);
         }
     }
@@ -327,12 +354,16 @@ impl<B: Backend> Controller<B> {
     /// Re-resolves each stream's output on its interval, or at once after
     /// its presentation thread reported that the CRTC disappeared.
     pub fn refresh(&mut self, now: u64) {
+        if self.streams.values().all(|stream| stream.closing) {
+            return;
+        }
         let layout_changed = self.backend.poll_layout();
         let due: Vec<u64> = self
             .streams
             .iter()
             .filter(|(_, stream)| {
-                stream.frames.fault().is_none()
+                !stream.closing
+                    && stream.frames.fault().is_none()
                     && (stream.frames.take_resolve_request()
                         || layout_changed
                         || now >= stream.next_resolve_ms)
@@ -466,8 +497,51 @@ impl<B: Backend> Controller<B> {
         self.settings.enabled = false;
         let ids: Vec<u64> = self.streams.keys().copied().collect();
         for id in ids {
-            self.end_stream(id);
+            let stream = self.streams.get_mut(&id).expect("stream exists");
+            stream.frames.admission.close();
+            stream.presenter.stop();
+            self.finish_stream(id);
         }
+    }
+
+    pub fn poll_retirement(&mut self) -> CaptureResult<bool> {
+        let streams = self.poll_stream_retirement(false);
+        let helpers = self.backend.poll_retirement();
+        Ok(streams? && helpers?)
+    }
+
+    pub fn quiesce(&mut self) -> CaptureResult<bool> {
+        self.settings.enabled = false;
+        let streams = self.poll_stream_retirement(true);
+        let helpers = self.backend.poll_retirement();
+        let callbacks = self.callbacks_retired();
+        Ok(streams? && helpers? && callbacks)
+    }
+
+    fn poll_stream_retirement(&mut self, close_all: bool) -> CaptureResult<bool> {
+        let streams: Vec<_> = self
+            .streams
+            .iter()
+            .filter(|(_, stream)| close_all || stream.closing)
+            .map(|(id, stream)| (*id, stream.owner.clone()))
+            .collect();
+        let mut ready = true;
+        let mut failure = None;
+        for (id, owner) in streams {
+            match self.close(&owner, id) {
+                Ok(retired) => ready &= retired,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        failure.map_or(Ok(ready), Err)
+    }
+
+    pub fn callbacks_retired(&mut self) -> bool {
+        self.retiring_admissions
+            .retain(|admission| !admission.is_idle());
+        self.retiring_admissions.is_empty()
     }
 }
 
@@ -508,6 +582,8 @@ fn stream_reply(id: u64, stream: &Stream) -> Value {
         "refresh_hz": stream.binding.mode.refresh_hz,
         "frame_transport": "dmabuf",
         "geometry_supported": stream.geometry.supported(),
+        "closing": stream.closing,
+        "retirement_failed": stream.presenter.retirement_failed(),
     });
     if let StreamGeometry::Ready(geometry) = stream.geometry {
         reply["desktop_geometry"] = json!(geometry);

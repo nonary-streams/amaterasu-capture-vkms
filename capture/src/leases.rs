@@ -15,10 +15,23 @@ use std::{
 /// Includes completion-fence quarantine across all streams and stream restarts.
 const MAX_RETAINED_REFERENCES: usize = 8;
 static RETAINED_REFERENCES: AtomicUsize = AtomicUsize::new(0);
+static QUARANTINED_REFERENCES: AtomicUsize = AtomicUsize::new(0);
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
 pub(crate) static TEST_LEASE_CALLBACKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn retirement_ready() -> Result<bool, &'static str> {
+    if QUARANTINED_REFERENCES.load(Ordering::Acquire) != 0 {
+        return Err("VKMS frame retirement is blocked by quarantined native storage");
+    }
+    Ok(RETAINED_REFERENCES.load(Ordering::Acquire) == 0)
+}
+
+fn quarantine(stored: Arc<StoredFrame>) {
+    QUARANTINED_REFERENCES.fetch_add(1, Ordering::AcqRel);
+    std::mem::forget(stored);
+}
 
 pub fn descriptor(stored: &Arc<StoredFrame>) -> Result<DmaBufFrameLease, Status> {
     if !stored.immutable() {
@@ -72,11 +85,11 @@ pub(crate) unsafe extern "C" fn release_resource(context: *mut c_void, completio
             // release. Pin it for the process lifetime and keep its bounded
             // reference slot occupied. No worker thread or callback outlives
             // the binding; this rare failure trades availability for safety.
-            std::mem::forget(stored);
+            quarantine(stored);
             return;
         }
     } else if completion_fence_fd != -1 {
-        std::mem::forget(stored);
+        quarantine(stored);
         return;
     }
     drop(stored);

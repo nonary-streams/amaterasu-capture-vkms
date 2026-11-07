@@ -379,6 +379,42 @@ hardware, and the video and encoder import path remain separate acceptance
 gates. Behavior was modeled on Vibeshine's KMS capture; no Vibeshine
 source was copied.
 
+### Source shutdown and retained frames
+
+Close retains its exact cleanup intent and broker request without waiting for a
+busy controller. Once admitted to the controller, it rejects new native reads
+and waits for the presentation worker and its source destructor to finish. Ordinary
+ticks poll worker retirement, so a blocked driver, snapshot, or source destructor
+does not block unrelated broker requests. Successful local close clears the
+cached frame even when a metadata reader or readiness subscription remains.
+Already admitted callbacks and retained immutable frames keep their exact storage
+until their rightful release. Host quiescence waits for those callbacks and all
+retained private-copy or producer leases. A quarantined frame produces a stable
+retirement error; its native storage and bounded lease slot remain fenced.
+
+The pinned SDK provides the quiescence hook but no advance shutdown announcement.
+The provider therefore closes new admission when the host reaches its dependency
+ordered quiescence phase. Final destruction remains synchronous containment.
+Synthetic source and descriptor tests verify local worker and ownership behavior;
+they do not qualify GPU driver interruption or real capture cleanup.
+
+Package-approved sources require the version-two authority precheck and handoff.
+An independent receipt remains readable after frame-socket shutdown; Close waits
+for the authority to verify the exact privileged helper was reaped. A bounded
+backend registry reserves ownership before the handoff and retains receipts for
+failed greetings, card opens, initial exports, probes, or source initialization.
+Version two does not start a helper until the first validated HELLO, sent only
+after the provider has retained its receipt. Missing, malformed, or failed
+retirement proof never becomes successful cleanup.
+
+This requires an updated protected authority binary. Updating only this capture
+component while retaining an old authority is insufficient: the provider fails
+as explicitly unsupported before privileged helper admission. It never falls
+back to an ambient legacy executable. Explicitly selected legacy helper mode
+also retains an owned reaper receipt and requires verified process retirement.
+Protocol fixtures and synthetic process ownership tests prove these boundaries;
+actual installed authority, driver, and helper cleanup remain native qualification.
+
 ### Cursor limitation
 
 Only the primary plane is exported. A cursor rendered by the compositor into that plane is captured, but a separate hardware cursor plane is not composited and may be absent from the stream. The current driver export does not report whether a separate cursor plane is active, so the provider cannot detect this per frame. Hardware cursor composition remains unimplemented.

@@ -22,6 +22,7 @@ mod model;
 mod native;
 mod output_name;
 mod presenter;
+mod retirement;
 mod snapshot;
 mod threading;
 
@@ -42,6 +43,7 @@ use std::{
 
 const SERVICE: &str = "amaterasu.capture-vkms/1";
 const REQUESTS_PER_TICK: usize = 8;
+const MAX_PENDING_CLOSES: usize = 32;
 
 /// Package composition may request the reserved false settings placeholder
 /// only when the selected artifact supports that field. This marker establishes
@@ -75,6 +77,15 @@ struct CaptureModule {
     _factory: Box<native::Factory<NativeBackend>>,
     _preflight_factory: Box<SourcePreflightFactory<VkmsPreflight>>,
     epoch: Instant,
+    pending_closes: Vec<PendingClose>,
+}
+
+struct PendingClose {
+    request: Option<u64>,
+    caller: String,
+    stream: u64,
+    cleanup_started: bool,
+    reply: Option<serde_json::Value>,
 }
 
 impl ManagedModule for CaptureModule {
@@ -115,13 +126,21 @@ impl ManagedModule for CaptureModule {
             _factory: factory,
             _preflight_factory: preflight_factory,
             epoch: Instant::now(),
+            pending_closes: Vec::new(),
         })
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
         self.log_queue.flush(&self.runtime);
+        self.poll_pending_closes()?;
         let now = self.epoch.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        self.lock_controller()?.refresh(now);
+        {
+            let mut controller = self.lock_controller()?;
+            // Per-stream failures stay visible to their Close waiters and in
+            // status. Continue independent requests; quiescence aggregates them.
+            let _ = controller.poll_retirement();
+            controller.refresh(now);
+        }
         for _ in 0..REQUESTS_PER_TICK {
             let (id, caller, service, payload) = match self.runtime.send(Command::Poll {})? {
                 Response::Pending => break,
@@ -149,6 +168,22 @@ impl ManagedModule for CaptureModule {
         }
         Ok(())
     }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        let pending_result = self.poll_pending_closes();
+        let callbacks_result = match self.controller.try_lock() {
+            Ok(mut controller) => controller.quiesce().map_err(|error| error.message),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                Err("vibeshine_drm capture controller poisoned during shutdown".into())
+            }
+        };
+        let retained_result = crate::leases::retirement_ready().map_err(str::to_owned);
+        let callbacks_retired = callbacks_result?;
+        let retained_frames_retired = retained_result?;
+        pending_result?;
+        Ok(callbacks_retired && retained_frames_retired && self.pending_closes.is_empty())
+    }
 }
 
 impl CaptureModule {
@@ -167,6 +202,19 @@ impl CaptureModule {
         operation: Operation,
         now: u64,
     ) -> ModuleResult<()> {
+        if let Operation::Close { stream } = operation {
+            if self.pending_closes.len() >= MAX_PENDING_CLOSES {
+                return self.complete(id, CaptureError::code("resource_exhausted").payload());
+            }
+            self.pending_closes.push(PendingClose {
+                request: Some(id),
+                caller: caller.into(),
+                stream,
+                cleanup_started: false,
+                reply: None,
+            });
+            return self.poll_pending_closes();
+        }
         let reply = self.lock_controller()?.handle(caller, operation, now);
         let (payload, created) = match reply {
             Ok(reply) => (reply.payload, reply.created),
@@ -186,6 +234,86 @@ impl CaptureModule {
             }
         }
         Ok(())
+    }
+
+    fn poll_pending_closes(&mut self) -> ModuleResult<()> {
+        let mut index = 0;
+        let mut failure = None;
+        while index < self.pending_closes.len() {
+            let pending = &mut self.pending_closes[index];
+            let progress = Self::poll_close_target(&self.controller, pending)
+                .and_then(|()| Self::settle_close_request(&self.runtime, pending));
+            match progress {
+                Ok(true) => {
+                    self.pending_closes.remove(index);
+                }
+                Ok(false) => {
+                    index += 1;
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    index += 1;
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn poll_close_target(
+        controller: &native::Shared<NativeBackend>,
+        pending: &mut PendingClose,
+    ) -> ModuleResult<()> {
+        if pending.reply.is_some() {
+            return Ok(());
+        }
+        let mut controller = match controller.try_lock() {
+            Ok(controller) => controller,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("vibeshine_drm capture controller poisoned during close".into());
+            }
+        };
+        let closed = controller.close(&pending.caller, pending.stream);
+        pending.cleanup_started = true;
+        pending.reply = match closed {
+            Ok(false) => None,
+            Ok(true) => Some(serde_json::json!({"ok":true})),
+            Err(error) => Some(error.payload()),
+        };
+        Ok(())
+    }
+
+    fn settle_close_request(
+        runtime: &RuntimeClient,
+        pending: &mut PendingClose,
+    ) -> ModuleResult<bool> {
+        let Some(request) = pending.request else {
+            return Ok(pending.cleanup_started || pending.reply.is_some());
+        };
+        let checked = runtime.send(Command::CheckRequest { request })?;
+        if matches!(&checked, Response::Error { code, .. } if code == "request_ended" || code == "not_found")
+        {
+            pending.request = None;
+            return Ok(pending.cleanup_started || pending.reply.is_some());
+        }
+        if !matches!(checked, Response::Ok) {
+            return Err(format!(
+                "vibeshine_drm close request check failed: {checked:?}"
+            ));
+        }
+        let Some(payload) = pending.reply.clone() else {
+            return Ok(false);
+        };
+        let completed = runtime.send(Command::Complete { request, payload })?;
+        if matches!(&completed, Response::Ok)
+            || matches!(&completed, Response::Error { code, .. } if code == "request_ended" || code == "not_found")
+        {
+            Ok(true)
+        } else {
+            Err(format!(
+                "vibeshine_drm close completion failed: {completed:?}"
+            ))
+        }
     }
 
     fn complete(&self, id: u64, payload: serde_json::Value) -> ModuleResult<()> {

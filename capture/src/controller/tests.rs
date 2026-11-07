@@ -28,6 +28,10 @@ fn opened(controller: &mut Controller<FakeBackend>) -> u64 {
         .unwrap()
 }
 
+fn close(controller: &mut Controller<FakeBackend>, stream: u64) {
+    assert!(eventually(|| controller.close(VIDEO, stream).unwrap()));
+}
+
 #[test]
 fn open_resolves_the_crtc_and_reports_compositor_geometry() {
     let (mut controller, backend) = controller();
@@ -92,9 +96,9 @@ fn open_replays_lookup_and_close_are_caller_scoped() {
         "not_found"
     );
     let frames = controller.reader(VIDEO, id).unwrap().frames;
-    controller.close(VIDEO, id).unwrap();
+    close(&mut controller, id);
     assert!(frames.admission.enter().is_none());
-    controller.close(VIDEO, id).unwrap();
+    close(&mut controller, id);
     assert_eq!(
         controller.reader(VIDEO, id).err().unwrap().code,
         "not_found"
@@ -411,7 +415,7 @@ fn close_stops_the_presentation_thread_promptly() {
         .sequence
         == 1));
     let started = std::time::Instant::now();
-    controller.close(VIDEO, id).unwrap();
+    close(&mut controller, id);
     assert!(started.elapsed() < std::time::Duration::from_millis(100));
     let waits = backend.script.waits.lock().unwrap().len();
     std::thread::sleep(std::time::Duration::from_millis(20));
@@ -421,6 +425,36 @@ fn close_stops_the_presentation_thread_promptly() {
     // Presenter retirement is asynchronous; let its final admitted stack
     // reference retire before asserting descriptor closure under parallel load.
     assert!(eventually(|| backend.script.all_lent_descriptors_closed()));
+}
+
+#[test]
+fn close_releases_cached_descriptors_while_reader_metadata_remains() {
+    let (mut controller, backend) = controller();
+    let id = opened(&mut controller);
+    let reader = controller.reader(VIDEO, id).unwrap();
+    backend.script.present(1, 1_000_000);
+    assert!(eventually(|| reader
+        .frames
+        .latest_presentation()
+        .unwrap()
+        .sequence
+        == 1));
+    assert_eq!(backend.script.open_descriptors(), 1);
+
+    close(&mut controller, id);
+
+    assert_eq!(
+        backend
+            .script
+            .source_drops
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(backend.script.open_descriptors(), 0);
+    assert!(matches!(
+        reader.frames.lend(),
+        Err(amaterasu_media::MEDIA_CLOSED)
+    ));
 }
 
 #[test]
@@ -480,6 +514,7 @@ fn stream_limits_and_rollback() {
         .handle(VIDEO, open("kwin:Virtual-9", "lost"), 0)
         .unwrap();
     controller.rollback(VIDEO, reply.created);
+    assert!(eventually(|| controller.poll_retirement().unwrap()));
     let status = controller
         .handle(VIDEO, Operation::Status, 0)
         .unwrap()

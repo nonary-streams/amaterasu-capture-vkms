@@ -31,6 +31,10 @@ impl Admission {
     pub fn close(&self) {
         self.0.fetch_or(CLOSED, Ordering::SeqCst);
     }
+
+    pub fn is_idle(&self) -> bool {
+        self.0.load(Ordering::SeqCst) & READERS == 0
+    }
 }
 
 pub struct Permit(Arc<Admission>);

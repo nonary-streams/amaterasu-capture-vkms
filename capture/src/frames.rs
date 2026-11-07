@@ -154,6 +154,20 @@ impl StreamFrames {
         self.crtc_id.load(Ordering::SeqCst)
     }
 
+    /// End delivery after the presentation thread has joined. Metadata readers
+    /// and subscriptions may retain this object without retaining native frames;
+    /// an already admitted Lent or retained lease still owns its exact storage.
+    pub fn close(&self) {
+        self.admission.close();
+        let replaced = {
+            let mut newest = self.lock_newest();
+            newest.direct_deadline = None;
+            std::mem::replace(&mut newest.frame, Err(MEDIA_CLOSED))
+        };
+        drop(replaced);
+        self.events.close("stream_closed");
+    }
+
     pub fn retarget(&self, crtc_id: u32) {
         let mut newest = self.lock_newest();
         self.crtc_id.store(crtc_id, Ordering::SeqCst);

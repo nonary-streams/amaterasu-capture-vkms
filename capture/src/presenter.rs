@@ -45,6 +45,11 @@ const MAX_CONSECUTIVE_DRIVER_ERRORS: u32 = 10;
 /// Exports presentations of one CRTC. The production source is a helper
 /// process; the thread owning it is the only caller.
 pub trait FrameSource: Send {
+    /// Independent proof for a privileged helper outside the local worker.
+    /// Sources with remote native ownership must supply the exact session receipt.
+    fn retirement(&self) -> Option<Arc<dyn crate::retirement::Retirement>> {
+        None
+    }
     /// Source descriptors prevent producer retirement until their last release.
     fn holds_producer(&self) -> bool {
         false
@@ -74,6 +79,10 @@ pub struct PresentationThread {
     stop: Arc<AtomicBool>,
     interrupt: Arc<dyn SourceInterrupt>,
     handle: Option<JoinHandle<()>>,
+    retirement_failed: bool,
+    worker_failed: Arc<AtomicBool>,
+    source_retirement: Option<Arc<dyn crate::retirement::Retirement>>,
+    source_retirement_error: Option<String>,
 }
 
 impl PresentationThread {
@@ -91,7 +100,10 @@ impl PresentationThread {
     ) -> io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let interrupt = source.interrupter();
+        let source_retirement = source.retirement();
         let child_stop = stop.clone();
+        let worker_failed = Arc::new(AtomicBool::new(false));
+        let child_failed = worker_failed.clone();
         let (ready, initialized) = std::sync::mpsc::sync_channel(1);
         let handle = thread::Builder::new()
             .name("vkms-presentation".into())
@@ -113,6 +125,7 @@ impl PresentationThread {
                 presenter.logger = logger;
                 let _ = ready.send(true);
                 if catch_unwind(AssertUnwindSafe(|| presenter.run())).is_err() {
+                    child_failed.store(true, Ordering::SeqCst);
                     frames.set_fault(StreamFault::HelperFailed);
                 }
             })?;
@@ -126,6 +139,10 @@ impl PresentationThread {
             stop,
             interrupt,
             handle: Some(handle),
+            retirement_failed: false,
+            worker_failed,
+            source_retirement,
+            source_retirement_error: None,
         })
     }
 
@@ -137,18 +154,63 @@ impl PresentationThread {
         }
     }
 
-    /// Stops the thread and waits for it, which also ends the helper.
-    /// Interrupting the source makes a pending WAIT or FRAME return at once,
-    /// so this takes about as long as the helper takes to exit; a source that
-    /// ignores interrupts still returns within one WAIT timeout.
-    pub fn stop(&mut self) {
-        let Some(handle) = self.handle.take() else {
-            return;
+    /// Announce cancellation without waiting for helper, snapshot, or driver
+    /// teardown. Only the owning worker destroys its source and native state.
+    pub fn begin_stop(&self) {
+        if !self.stop.swap(true, Ordering::SeqCst) {
+            self.interrupt.interrupt();
+        }
+        self.wake();
+    }
+
+    /// Join only after the worker and all of its destructors have finished.
+    pub fn poll_stop(&mut self) -> Result<bool, String> {
+        self.begin_stop();
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            return Ok(false);
+        }
+        if let Some(handle) = self.handle.take() {
+            self.retirement_failed |= handle.join().is_err();
+        }
+        self.retirement_failed |= self.worker_failed.load(Ordering::SeqCst);
+        let source_retired = match &self.source_retirement {
+            Some(receipt) => match receipt.poll_retired() {
+                Ok(retired) => retired,
+                Err(error) => {
+                    self.source_retirement_error.get_or_insert_with(|| {
+                        format!("native helper retirement was not verified: {error}")
+                    });
+                    false
+                }
+            },
+            None => true,
         };
-        self.stop.store(true, Ordering::SeqCst);
-        self.interrupt.interrupt();
-        handle.thread().unpark();
-        let _ = handle.join();
+        if self.retirement_failed {
+            Err("presentation worker failed during retirement".into())
+        } else if let Some(error) = &self.source_retirement_error {
+            Err(error.clone())
+        } else {
+            Ok(source_retired)
+        }
+    }
+
+    pub fn retirement_failed(&self) -> bool {
+        self.retirement_failed
+            || self.worker_failed.load(Ordering::SeqCst)
+            || self.source_retirement_error.is_some()
+    }
+
+    /// Final containment waits for the worker; ordinary Close and quiescence
+    /// use begin_stop/poll_stop so a driver or destructor cannot block the host.
+    pub fn stop(&mut self) {
+        self.begin_stop();
+        if let Some(handle) = self.handle.take() {
+            self.retirement_failed |= handle.join().is_err();
+        }
     }
 
     #[cfg(test)]
@@ -345,6 +407,9 @@ impl Presenter {
             Ok(presentation) => presentation,
             Err(error) => return self.failed(&error),
         };
+        if self.finished() {
+            return Next::Exit;
+        }
         let requested = self.producer_held && self.frames.take_capture_request();
         if presentation.flags & PRESENT_TIMEOUT != 0 {
             self.diagnostics.timeouts = self.diagnostics.timeouts.saturating_add(1);
@@ -375,6 +440,9 @@ impl Presenter {
         let started = Instant::now();
         let result = self.source.frame(self.crtc_id);
         self.diagnostics.export.record(started.elapsed());
+        if self.finished() {
+            return Next::Exit;
+        }
         match result {
             Ok(FrameExport::Ready(exported)) => {
                 self.consecutive_driver_errors = 0;
@@ -417,6 +485,9 @@ impl Presenter {
     /// completed scanout, which may already be newer than the WAIT result;
     /// gaps are coalesced.
     fn publish(&mut self, exported: ExportedFrame, waited_sequence: u64) {
+        if self.finished() {
+            return;
+        }
         let exported_sequence = exported.descriptor.sequence;
         let previous = self.driver_sequence;
         self.diagnostics

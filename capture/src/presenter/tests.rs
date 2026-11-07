@@ -254,8 +254,8 @@ fn a_missing_crtc_requests_re_resolution_and_follows_the_retarget() {
 #[test]
 fn a_refused_export_is_handled_like_a_refused_wait() {
     let run = running();
-    run.script.push_wait(ScriptedWait::Presented(1));
     run.script.push(Scripted::Refuse(Failure::CrtcNotFound));
+    run.script.push_wait(ScriptedWait::Presented(1));
     assert!(eventually(|| run.frames.take_resolve_request()));
     run.thread.wake();
     run.script.present(2, EPOCH_NS);
@@ -335,6 +335,58 @@ fn stop_interrupts_a_pending_wait_promptly() {
     // Stopping is not a helper failure, and stopping twice is harmless.
     assert_eq!(run.frames.fault(), None);
     run.thread.stop();
+}
+
+#[test]
+fn cancellation_after_a_successful_wait_does_not_start_a_frame_export() {
+    struct StopAfterWait {
+        source: FakeSource,
+        stop: Arc<AtomicBool>,
+    }
+    impl FrameSource for StopAfterWait {
+        fn wait(
+            &mut self,
+            crtc: u32,
+            sequence: u64,
+            timeout: u32,
+        ) -> Result<
+            amaterasu_vkms_frame_helper::client::Presentation,
+            amaterasu_vkms_frame_helper::client::ClientError,
+        > {
+            let result = self.source.wait(crtc, sequence, timeout);
+            self.stop.store(true, Ordering::SeqCst);
+            result
+        }
+        fn frame(
+            &mut self,
+            crtc: u32,
+        ) -> Result<
+            amaterasu_vkms_frame_helper::client::FrameExport,
+            amaterasu_vkms_frame_helper::client::ClientError,
+        > {
+            self.source.frame(crtc)
+        }
+        fn interrupter(&self) -> Arc<dyn SourceInterrupt> {
+            self.source.interrupter()
+        }
+    }
+    let script = Arc::new(SourceScript::default());
+    script.present(1, EPOCH_NS);
+    let stop = Arc::new(AtomicBool::new(false));
+    let frames = Arc::new(StreamFrames::new(41, EPOCH_NS));
+    let mut presenter = Presenter::new(
+        Box::new(StopAfterWait {
+            source: FakeSource::new(script.clone()),
+            stop: stop.clone(),
+        }),
+        frames.clone(),
+        stop,
+        None,
+    );
+
+    assert!(matches!(presenter.step(), Next::Exit));
+    assert!(script.requested_crtcs.lock().unwrap().is_empty());
+    assert_eq!(frames.latest_presentation().unwrap().sequence, 0);
 }
 
 #[test]

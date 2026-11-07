@@ -22,10 +22,14 @@ use std::{
         },
     },
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
+
+mod retirement;
+pub use retirement::{ProcessRetirementReceipt, retire_child};
 
 const GROUP_OR_OTHER_WRITE: u32 = 0o022;
 const SET_ID_BITS: u32 = 0o6000;
@@ -33,7 +37,6 @@ const ANY_EXECUTE: u32 = 0o111;
 /// Spawn-time descriptors are moved at least this high so neither can
 /// collide with fd 3 in the child.
 const SPAWN_DESCRIPTOR_FLOOR: RawFd = 10;
-const SHUTDOWN_GRACE: Duration = Duration::from_millis(50);
 const STARTUP_EXIT_GRACE: Duration = Duration::from_millis(200);
 
 /// What `fstat` says about the configured helper file.
@@ -109,7 +112,7 @@ pub fn open_verified_helper(path: &Path) -> Result<File, HelperFileProblem> {
 /// A running helper and the client connected to it.
 pub struct HelperProcess {
     client: Option<HelperClient>,
-    child: Child,
+    retirement: Arc<ProcessRetirementReceipt>,
 }
 
 impl HelperProcess {
@@ -134,13 +137,29 @@ impl HelperProcess {
         unsafe {
             command.pre_exec(move || place_control_socket(socket));
         }
-        let child = command.spawn()?;
+        let (retirement, adopt) = ProcessRetirementReceipt::prepare()?;
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                drop(adopt);
+                drop(retirement);
+                return Err(error);
+            }
+        };
+        if let Err(error) = adopt.send(child) {
+            let mut child = error.0;
+            retire_child(&mut child, Duration::ZERO, |_| {})?;
+            return Err(io::Error::other(
+                "frame helper reaper stopped before adopting child",
+            ));
+        }
+        drop(adopt);
         // The child holds its own copies now; close the parent's.
         drop(theirs);
         drop(executable);
         Ok(Self {
             client: Some(HelperClient::new(ours)),
-            child,
+            retirement,
         })
     }
 
@@ -153,8 +172,8 @@ impl HelperProcess {
     pub fn startup_refusal(&mut self) -> String {
         let deadline = Instant::now() + STARTUP_EXIT_GRACE;
         loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => {
+            match self.retirement.observed_exit() {
+                Some(status) => {
                     return match (status.code(), status.signal()) {
                         (Some(code), _) => exit_status::describe(code as u8).into(),
                         (None, Some(signal)) => {
@@ -163,26 +182,26 @@ impl HelperProcess {
                         (None, None) => "the frame helper exited".into(),
                     };
                 }
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(2)),
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(2)),
                 _ => return "the frame helper closed its control socket".into(),
             }
         }
     }
 }
 
+impl HelperProcess {
+    /// Keep this receipt in a bounded lifecycle registry before greeting the helper.
+    pub fn retirement_receipt(&self) -> Arc<ProcessRetirementReceipt> {
+        self.retirement.clone()
+    }
+}
+
 impl Drop for HelperProcess {
     fn drop(&mut self) {
-        // Closing the socket is the helper's signal to exit.
         drop(self.client.take());
-        let deadline = Instant::now() + SHUTDOWN_GRACE;
-        while Instant::now() < deadline {
-            if !matches!(self.child.try_wait(), Ok(None)) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // The registry's receipt owns the reaper. Normal close/probe/error paths
+        // only signal it; final last-owner Drop is the synchronous safety barrier.
+        self.retirement.begin();
     }
 }
 

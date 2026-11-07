@@ -439,12 +439,12 @@ fn other_callers_and_closed_streams_cannot_read() {
     assert_eq!(other.read(id, &mut sink), MEDIA_CLOSED);
 
     let owner = TestBinding::bind(&factory, b"amaterasu.video", 5).unwrap();
-    factory
+    assert!(eventually(|| factory
         .controller
         .lock()
         .unwrap()
         .close("amaterasu.video", id)
-        .unwrap();
+        .unwrap()));
     assert_eq!(owner.read(id, &mut sink), MEDIA_CLOSED);
     assert_eq!(owner.latest(id), Err(MEDIA_CLOSED));
     assert!(sink.deliveries.is_empty());
@@ -514,12 +514,12 @@ fn immutable_native_read_rejects_mutable_scanout_and_retains_private_snapshot() 
         STATUS_OK
     );
     let lease = retained.0.take().unwrap();
-    factory
+    assert!(eventually(|| factory
         .controller
         .lock()
         .unwrap()
-        .handle("amaterasu.video", Operation::Close { stream: id }, 0)
-        .unwrap();
+        .close("amaterasu.video", id)
+        .unwrap()));
     drop(frames);
     assert_eq!(script.open_descriptors(), 1);
     // SAFETY: consumes the one retained reference while binding remains live.
@@ -746,12 +746,12 @@ fn readiness_subscription_authorization_and_binding_release_follow_stream_owners
         unsafe { (api.subscribe_events)(api.base.base.context, stream, sink) },
         STATUS_OK
     );
-    factory
+    assert!(eventually(|| factory
         .controller
         .lock()
         .unwrap()
         .close("amaterasu.video", stream)
-        .unwrap();
+        .unwrap()));
     assert_eq!(notices.stopped.load(Ordering::SeqCst), 1);
     unsafe { (api.unsubscribe_events)(api.base.base.context, stream) };
     drop(owner);

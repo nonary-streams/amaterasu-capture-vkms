@@ -195,6 +195,39 @@ impl SeqpacketChannel {
 
     /// Receives one record into `buffer`. Descriptors arrive close-on-exec.
     pub fn receive(&self, buffer: &mut [u8]) -> io::Result<Received> {
+        self.receive_with_flags(buffer, 0)
+    }
+
+    /// Receives an already available record without blocking the calling thread.
+    pub fn receive_nonblocking(&self, buffer: &mut [u8]) -> io::Result<Received> {
+        self.receive_with_flags(buffer, libc::MSG_DONTWAIT)
+    }
+
+    /// Examines the first record without consuming it or blocking. Transported
+    /// descriptors are duplicated by the kernel and owned by the returned record.
+    pub fn peek_nonblocking(&self, buffer: &mut [u8]) -> io::Result<Received> {
+        self.receive_with_flags(buffer, libc::MSG_DONTWAIT | libc::MSG_PEEK)
+    }
+
+    /// Observes peer shutdown without consuming a queued protocol record.
+    pub fn peer_closed(&self) -> io::Result<bool> {
+        let mut descriptor = libc::pollfd {
+            fd: self.socket.as_raw_fd(),
+            events: libc::POLLRDHUP,
+            revents: 0,
+        };
+        // SAFETY: poll receives one initialized descriptor and does not retain it.
+        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        Ok(descriptor.revents & (libc::POLLRDHUP | libc::POLLHUP) != 0)
+    }
+
+    fn receive_with_flags(&self, buffer: &mut [u8], flags: libc::c_int) -> io::Result<Received> {
         let mut payload = libc::iovec {
             iov_base: buffer.as_mut_ptr().cast(),
             iov_len: buffer.len(),
@@ -212,7 +245,7 @@ impl SeqpacketChannel {
                 libc::recvmsg(
                     self.socket.as_raw_fd(),
                     &mut message,
-                    libc::MSG_CMSG_CLOEXEC,
+                    libc::MSG_CMSG_CLOEXEC | flags,
                 )
             };
             if received >= 0 {
