@@ -113,8 +113,28 @@ static bool initialize(struct am_vkms_snapshotter *snapshotter) {
         return false;
     const EGLint surface[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
     const EGLint context[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+    /* The snapshot runs on the capture path between a game's frames. Ask for
+     * a high-priority context so it does not wait out the game's timeslice;
+     * the driver may grant less, so the granted level is reported. */
+    const EGLint prioritized[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_CONTEXT_PRIORITY_LEVEL_IMG,
+                                  EGL_CONTEXT_PRIORITY_HIGH_IMG, EGL_NONE};
+    const bool priority = extension(extensions, "EGL_IMG_context_priority");
     snapshotter->surface = eglCreatePbufferSurface(snapshotter->display, config, surface);
-    snapshotter->context = eglCreateContext(snapshotter->display, config, EGL_NO_CONTEXT, context);
+    snapshotter->context = EGL_NO_CONTEXT;
+    if (priority)
+        snapshotter->context =
+            eglCreateContext(snapshotter->display, config, EGL_NO_CONTEXT, prioritized);
+    if (snapshotter->context == EGL_NO_CONTEXT)
+        snapshotter->context = eglCreateContext(snapshotter->display, config, EGL_NO_CONTEXT, context);
+    EGLint granted = 0;
+    if (priority && snapshotter->context != EGL_NO_CONTEXT)
+        (void)eglQueryContext(snapshotter->display, snapshotter->context,
+                              EGL_CONTEXT_PRIORITY_LEVEL_IMG, &granted);
+    fprintf(stderr, "amaterasu vkms snapshot: GPU priority=%s requested=high\n",
+            granted == EGL_CONTEXT_PRIORITY_HIGH_IMG     ? "high"
+            : granted == EGL_CONTEXT_PRIORITY_MEDIUM_IMG ? "medium"
+            : granted == EGL_CONTEXT_PRIORITY_LOW_IMG    ? "low"
+                                                         : "unavailable");
     if (snapshotter->surface == EGL_NO_SURFACE || snapshotter->context == EGL_NO_CONTEXT ||
         eglMakeCurrent(snapshotter->display, snapshotter->surface, snapshotter->surface,
                        snapshotter->context) != EGL_TRUE) return false;
