@@ -21,6 +21,7 @@ mod leases;
 mod model;
 mod native;
 mod output_name;
+mod pending_open;
 mod presenter;
 mod retirement;
 mod snapshot;
@@ -78,6 +79,7 @@ struct CaptureModule {
     _preflight_factory: Box<SourcePreflightFactory<VkmsPreflight>>,
     epoch: Instant,
     pending_closes: Vec<PendingClose>,
+    pending_opens: pending_open::PendingOpens,
 }
 
 struct PendingClose {
@@ -127,6 +129,7 @@ impl ManagedModule for CaptureModule {
             _preflight_factory: preflight_factory,
             epoch: Instant::now(),
             pending_closes: Vec::new(),
+            pending_opens: pending_open::PendingOpens::default(),
         })
     }
 
@@ -142,6 +145,8 @@ impl ManagedModule for CaptureModule {
             // status. Continue independent requests; quiescence aggregates them.
             let _ = controller.poll_retirement();
             controller.refresh(now);
+            self.pending_opens
+                .poll(&self.runtime, &mut controller, now, false)?;
         }
         for _ in 0..REQUESTS_PER_TICK {
             // A preflight callback may be in a slow native probe. Acquire the
@@ -172,6 +177,12 @@ impl ManagedModule for CaptureModule {
                     drop(controller);
                     self.enqueue_close(id, &caller, stream)?;
                 }
+                Ok(operation @ Operation::Open { .. }) if service == SERVICE => {
+                    drop(controller);
+                    if !self.pending_opens.enqueue(id, &caller, operation, now) {
+                        self.complete(id, CaptureError::code("resource_exhausted").payload())?;
+                    }
+                }
                 Ok(operation) if service == SERVICE => {
                     Self::dispatch_locked(
                         &self.runtime,
@@ -190,22 +201,29 @@ impl ManagedModule for CaptureModule {
 
     fn quiesce(&mut self) -> ModuleResult<bool> {
         let pending_result = self.poll_pending_closes();
-        let callbacks_result = match self.controller.try_lock() {
-            Ok(mut controller) => controller.quiesce().map_err(|error| error.message),
-            Err(std::sync::TryLockError::WouldBlock) => Ok(false),
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                Err("vibeshine_drm capture controller poisoned during shutdown".into())
-            }
+        let (pending_open_result, callbacks_result) = match self.controller.try_lock() {
+            Ok(mut controller) => (
+                self.pending_opens
+                    .poll(&self.runtime, &mut controller, 0, true),
+                controller.quiesce().map_err(|error| error.message),
+            ),
+            Err(std::sync::TryLockError::WouldBlock) => (Ok(()), Ok(false)),
+            Err(std::sync::TryLockError::Poisoned(_)) => (
+                Ok(()),
+                Err("vibeshine_drm capture controller poisoned during shutdown".into()),
+            ),
         };
         let retained_result = crate::leases::retirement_ready().map_err(str::to_owned);
         let snapshots_retired = crate::snapshot::retirement_ready().map_err(str::to_owned)?;
         let callbacks_retired = callbacks_result?;
         let retained_frames_retired = retained_result?;
         pending_result?;
+        pending_open_result?;
         Ok(callbacks_retired
             && retained_frames_retired
             && snapshots_retired
-            && self.pending_closes.is_empty())
+            && self.pending_closes.is_empty()
+            && self.pending_opens.is_empty())
     }
 }
 
@@ -269,24 +287,7 @@ impl CaptureModule {
         now: u64,
     ) -> ModuleResult<()> {
         let reply = controller.handle(caller, operation, now);
-        let (payload, created) = match reply {
-            Ok(reply) => (reply.payload, reply.created),
-            Err(error) => (error.payload(), None),
-        };
-        let completion = runtime.send(Command::Complete {
-            request: id,
-            payload,
-        });
-        if !matches!(completion, Ok(Response::Ok)) {
-            controller.rollback(caller, created);
-            if !matches!(&completion, Ok(Response::Error { code, .. }) if code == "request_ended" || code == "not_found")
-            {
-                return Err(format!(
-                    "vibeshine_drm capture completion failed: {completion:?}"
-                ));
-            }
-        }
-        Ok(())
+        pending_open::complete_reply(runtime, controller, id, caller, reply)
     }
 
     fn poll_pending_closes(&mut self) -> ModuleResult<()> {

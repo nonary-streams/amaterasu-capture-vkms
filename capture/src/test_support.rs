@@ -391,6 +391,7 @@ pub struct FakeBackend {
     /// `None` models a host without a reachable Wayland display.
     pub layout: Arc<Mutex<Option<Vec<LayoutOutput>>>>,
     pub layout_changed: Arc<Mutex<bool>>,
+    pub pending_layout: Arc<Mutex<Option<Vec<LayoutOutput>>>>,
 }
 
 /// A scaled primary with the owned outputs appended to its right.
@@ -437,6 +438,7 @@ impl FakeBackend {
             connects: Arc::new(Mutex::new(Vec::new())),
             layout: Arc::new(Mutex::new(Some(appended_layout(1920)))),
             layout_changed: Arc::new(Mutex::new(false)),
+            pending_layout: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -450,6 +452,7 @@ impl FakeBackend {
             connects: self.connects.clone(),
             layout: self.layout.clone(),
             layout_changed: self.layout_changed.clone(),
+            pending_layout: self.pending_layout.clone(),
         }
     }
 }
@@ -522,6 +525,10 @@ impl Backend for FakeBackend {
     }
 
     fn poll_layout(&self) -> bool {
+        if let Some(layout) = self.pending_layout.lock().unwrap().take() {
+            *self.layout.lock().unwrap() = Some(layout);
+            return true;
+        }
         std::mem::take(&mut *self.layout_changed.lock().unwrap())
     }
 

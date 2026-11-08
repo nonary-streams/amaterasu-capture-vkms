@@ -341,6 +341,43 @@ fn without_a_wayland_display_geometry_is_unsupported() {
 }
 
 #[test]
+fn open_drains_layout_changes_accumulated_while_idle() {
+    let (mut controller, backend) = controller();
+    *backend.layout.lock().unwrap() = Some(appended_layout(2560));
+    *backend.pending_layout.lock().unwrap() = Some(appended_layout(1920));
+
+    let reply = controller
+        .handle(VIDEO, open("kwin:Virtual-9", "after-idle"), 0)
+        .unwrap();
+    assert_eq!(reply.payload["geometry_supported"], true);
+    close(&mut controller, reply.created.unwrap());
+}
+
+#[test]
+fn enumeration_refreshes_geometry_after_an_idle_layout_change() {
+    let (mut controller, backend) = controller();
+    *backend.layout.lock().unwrap() = Some(appended_layout(2560));
+    *backend.pending_layout.lock().unwrap() = Some(appended_layout(1920));
+    let reply = controller
+        .handle(
+            VIDEO,
+            Operation::Enumerate {
+                offset: None,
+                limit: None,
+            },
+            0,
+        )
+        .unwrap();
+    let output = reply.payload["outputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|output| output["id"] == "kwin:Virtual-9")
+        .unwrap();
+    assert_eq!(output["geometry_supported"], true);
+}
+
+#[test]
 fn an_inconsistent_layout_refuses_open_instead_of_guessing() {
     let (mut controller, backend) = controller();
     *backend.layout.lock().unwrap() = Some(appended_layout(2560));

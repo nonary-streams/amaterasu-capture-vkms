@@ -109,6 +109,11 @@ reply `{"ok":false,"error":{"code":"...","message":"..."}}`.
   `output_unavailable`, `output_geometry_unavailable`, `frame_helper_failed`
   and `resource_exhausted` (at most
   4 open streams and 128 per module instance).
+  If the compositor layout is still catching up with an otherwise resolved
+  output, the provider retries that read-only geometry check for up to four
+  seconds before reporting `output_geometry_unavailable` with its specific
+  reason. Cancellation and shutdown retire the pending request without
+  starting a helper or creating a capture stream.
 - `{"action":"lookup","operation_id":"video-1"}` recovers the caller's stream.
 - `{"action":"close","stream":123}` is idempotent for its owner. It stops
   admitting native reads at once, stops the stream's presentation thread and

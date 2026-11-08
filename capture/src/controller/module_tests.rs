@@ -13,6 +13,14 @@ use std::{
 
 const VIDEO: &str = "amaterasu.video";
 
+fn pending_open(operation_id: &str) -> Operation {
+    Operation::Open {
+        output: "kwin:Virtual-9".into(),
+        operation_id: Some(operation_id.into()),
+        constant_rate: None,
+    }
+}
+
 #[derive(Default)]
 struct HostFixture {
     completed: Mutex<Vec<serde_json::Value>>,
@@ -76,6 +84,144 @@ impl HostFixture {
     }
 }
 
+#[test]
+fn geometry_wait_retries_without_starting_a_helper_until_the_layout_settles() {
+    let host = Arc::new(HostFixture::default());
+    let backend = FakeBackend::new();
+    let handles = backend.handles();
+    *handles.layout.lock().unwrap() = Some(crate::test_support::appended_layout(2560));
+    let mut controller = Controller::new(backend, settings());
+    let mut opens = crate::pending_open::PendingOpens::default();
+    assert!(opens.enqueue(21, VIDEO, pending_open("settling"), 0));
+
+    opens
+        .poll(&host.runtime(), &mut controller, 0, false)
+        .unwrap();
+    assert!(host.completed.lock().unwrap().is_empty());
+    assert!(handles.connects.lock().unwrap().is_empty());
+    *handles.pending_layout.lock().unwrap() = Some(crate::test_support::appended_layout(1920));
+    opens
+        .poll(&host.runtime(), &mut controller, 49, false)
+        .unwrap();
+    assert!(handles.connects.lock().unwrap().is_empty());
+    opens
+        .poll(&host.runtime(), &mut controller, 50, false)
+        .unwrap();
+    assert!(opens.is_empty());
+    let completed = host.completed.lock().unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0]["payload"]["ok"], true);
+    assert_eq!(completed[0]["payload"]["geometry_supported"], true);
+    assert_eq!(handles.connects.lock().unwrap().len(), 1);
+    let stream = completed[0]["payload"]["stream"].as_u64().unwrap();
+    drop(completed);
+    controller.close(VIDEO, stream).unwrap();
+}
+
+#[test]
+fn geometry_wait_observes_cancellation_and_shutdown_without_creating_capture() {
+    for stopping in [false, true] {
+        let host = Arc::new(HostFixture::default());
+        let backend = FakeBackend::new();
+        let handles = backend.handles();
+        *handles.layout.lock().unwrap() = Some(crate::test_support::appended_layout(2560));
+        let mut controller = Controller::new(backend, settings());
+        let mut opens = crate::pending_open::PendingOpens::default();
+        assert!(opens.enqueue(22, VIDEO, pending_open("cancelled"), 0));
+        opens
+            .poll(&host.runtime(), &mut controller, 0, false)
+            .unwrap();
+        *handles.pending_layout.lock().unwrap() = Some(crate::test_support::appended_layout(1920));
+        if !stopping {
+            host.ended.lock().unwrap().insert(22);
+        }
+        opens
+            .poll(&host.runtime(), &mut controller, 50, stopping)
+            .unwrap();
+        assert!(opens.is_empty());
+        assert!(handles.connects.lock().unwrap().is_empty());
+        let completed = host.completed.lock().unwrap();
+        if stopping {
+            assert_eq!(completed[0]["payload"]["error"]["code"], "capture_stopping");
+        } else {
+            assert!(completed.is_empty());
+        }
+    }
+}
+
+#[test]
+fn geometry_wait_reports_the_last_specific_failure_at_its_deadline() {
+    let host = Arc::new(HostFixture::default());
+    let backend = FakeBackend::new();
+    let handles = backend.handles();
+    *handles.layout.lock().unwrap() = Some(crate::test_support::appended_layout(2560));
+    let mut controller = Controller::new(backend, settings());
+    let mut opens = crate::pending_open::PendingOpens::default();
+    assert!(opens.enqueue(23, VIDEO, pending_open("timeout"), 0));
+    opens
+        .poll(&host.runtime(), &mut controller, 0, false)
+        .unwrap();
+    opens
+        .poll(&host.runtime(), &mut controller, 4_000, false)
+        .unwrap();
+    assert!(opens.is_empty());
+    assert!(handles.connects.lock().unwrap().is_empty());
+    let completed = host.completed.lock().unwrap();
+    assert_eq!(
+        completed[0]["payload"]["error"]["code"],
+        "output_geometry_unavailable"
+    );
+    assert!(
+        completed[0]["payload"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("mode differs")
+    );
+}
+
+#[test]
+fn geometry_wait_does_not_retry_an_unrelated_open_refusal() {
+    let host = Arc::new(HostFixture::default());
+    let backend = FakeBackend::new();
+    let handles = backend.handles();
+    let mut controller = Controller::new(backend, settings());
+    let mut opens = crate::pending_open::PendingOpens::default();
+    assert!(opens.enqueue(24, "unauthorized", pending_open("denied"), 0));
+    opens
+        .poll(&host.runtime(), &mut controller, 0, false)
+        .unwrap();
+    assert!(opens.is_empty());
+    assert_eq!(
+        host.completed.lock().unwrap()[0]["payload"]["error"]["code"],
+        "capture_permission_denied"
+    );
+    assert!(handles.connects.lock().unwrap().is_empty());
+}
+
+#[test]
+fn module_dispatches_open_through_the_bounded_queue() {
+    let host = Arc::new(HostFixture::default());
+    let mut module = module(Controller::new(FakeBackend::new(), settings()));
+    module.runtime = host.runtime();
+    host.polls.lock().unwrap().push_back(crate::Response::Request {
+        id: 25,
+        caller: "unauthorized".into(),
+        initiator: "unauthorized".into(),
+        service: crate::SERVICE.into(),
+        payload: serde_json::json!({"action":"open", "output":"kwin:Virtual-9", "operation_id":"queued"}),
+        remaining_ms: 5_000,
+    });
+    module.tick().unwrap();
+    assert!(!module.pending_opens.is_empty());
+    assert!(host.completed.lock().unwrap().is_empty());
+    module.tick().unwrap();
+    assert!(module.pending_opens.is_empty());
+    assert_eq!(
+        host.completed.lock().unwrap()[0]["payload"]["error"]["code"],
+        "capture_permission_denied"
+    );
+}
+
 fn module(controller: Controller<FakeBackend>) -> crate::CaptureModule {
     unsafe extern "C" fn unused_host(
         _context: *mut c_void,
@@ -124,6 +270,7 @@ fn module(controller: Controller<FakeBackend>) -> crate::CaptureModule {
         _preflight_factory: preflight_factory,
         epoch: Instant::now(),
         pending_closes: Vec::new(),
+        pending_opens: crate::pending_open::PendingOpens::default(),
     }
 }
 

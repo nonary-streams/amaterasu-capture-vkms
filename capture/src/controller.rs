@@ -272,6 +272,10 @@ impl<B: Backend> Controller<B> {
     /// Geometry at open: unsupported without a Wayland display, otherwise
     /// it must be consistent now so the open reply never reports a wrong one.
     fn open_geometry(&self, binding: &OutputBinding) -> CaptureResult<StreamGeometry> {
+        // There may have been no open streams to drive refresh while the
+        // compositor changed modes. Drain queued layout events before using
+        // the cached snapshot for a new capture.
+        self.backend.poll_layout();
         let Some(layout) = self.backend.desktop_layout() else {
             return Ok(StreamGeometry::Unsupported);
         };
@@ -403,6 +407,9 @@ impl<B: Backend> Controller<B> {
             return Err(CaptureError::code("capture_permission_denied"));
         }
         let limit = limit.unwrap_or(MAX_ENUMERATION_LIMIT);
+        // Enumeration can be the first operation after an idle hotplug.
+        // Refresh the compositor view before attaching geometry metadata.
+        self.backend.poll_layout();
         let layout = self.backend.desktop_layout();
         let (outputs, driver) = match self.backend.discover() {
             Ok(discovery) => (
