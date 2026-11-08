@@ -135,13 +135,21 @@ impl ManagedModule for CaptureModule {
         self.poll_pending_closes()?;
         let now = self.epoch.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         {
-            let mut controller = self.lock_controller()?;
+            let Some(mut controller) = Self::try_controller(&self.controller)? else {
+                return Ok(());
+            };
             // Per-stream failures stay visible to their Close waiters and in
             // status. Continue independent requests; quiescence aggregates them.
             let _ = controller.poll_retirement();
             controller.refresh(now);
         }
         for _ in 0..REQUESTS_PER_TICK {
+            // A preflight callback may be in a slow native probe. Acquire the
+            // controller before polling so no request is stranded behind it.
+            let shared = Arc::clone(&self.controller);
+            let Some(mut controller) = Self::try_controller(&shared)? else {
+                return Ok(());
+            };
             let (id, caller, service, payload) = match self.runtime.send(Command::Poll {})? {
                 Response::Pending => break,
                 Response::Request {
@@ -160,8 +168,19 @@ impl ManagedModule for CaptureModule {
                 continue;
             }
             match serde_json::from_value::<Operation>(payload) {
+                Ok(Operation::Close { stream }) if service == SERVICE => {
+                    drop(controller);
+                    self.enqueue_close(id, &caller, stream)?;
+                }
                 Ok(operation) if service == SERVICE => {
-                    self.dispatch(id, &caller, operation, now)?
+                    Self::dispatch_locked(
+                        &self.runtime,
+                        &mut controller,
+                        id,
+                        &caller,
+                        operation,
+                        now,
+                    )?;
                 }
                 _ => self.complete(id, CaptureError::code("invalid_request").payload())?,
             }
@@ -187,6 +206,19 @@ impl ManagedModule for CaptureModule {
 }
 
 impl CaptureModule {
+    fn try_controller(
+        shared: &native::Shared<NativeBackend>,
+    ) -> ModuleResult<Option<std::sync::MutexGuard<'_, Controller<NativeBackend>>>> {
+        match shared.try_lock() {
+            Ok(controller) => Ok(Some(controller)),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                Err("vibeshine_drm capture controller poisoned".into())
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn lock_controller(
         &self,
     ) -> ModuleResult<std::sync::MutexGuard<'_, Controller<NativeBackend>>> {
@@ -195,6 +227,7 @@ impl CaptureModule {
             .map_err(|_| "vibeshine_drm capture controller poisoned".into())
     }
 
+    #[cfg(test)]
     fn dispatch(
         &mut self,
         id: u64,
@@ -203,29 +236,45 @@ impl CaptureModule {
         now: u64,
     ) -> ModuleResult<()> {
         if let Operation::Close { stream } = operation {
-            if self.pending_closes.len() >= MAX_PENDING_CLOSES {
-                return self.complete(id, CaptureError::code("resource_exhausted").payload());
-            }
-            self.pending_closes.push(PendingClose {
-                request: Some(id),
-                caller: caller.into(),
-                stream,
-                cleanup_started: false,
-                reply: None,
-            });
-            return self.poll_pending_closes();
+            return self.enqueue_close(id, caller, stream);
         }
-        let reply = self.lock_controller()?.handle(caller, operation, now);
+        let mut controller = self.lock_controller()?;
+        Self::dispatch_locked(&self.runtime, &mut controller, id, caller, operation, now)
+    }
+
+    fn enqueue_close(&mut self, id: u64, caller: &str, stream: u64) -> ModuleResult<()> {
+        if self.pending_closes.len() >= MAX_PENDING_CLOSES {
+            return self.complete(id, CaptureError::code("resource_exhausted").payload());
+        }
+        self.pending_closes.push(PendingClose {
+            request: Some(id),
+            caller: caller.into(),
+            stream,
+            cleanup_started: false,
+            reply: None,
+        });
+        self.poll_pending_closes()
+    }
+
+    fn dispatch_locked(
+        runtime: &RuntimeClient,
+        controller: &mut Controller<NativeBackend>,
+        id: u64,
+        caller: &str,
+        operation: Operation,
+        now: u64,
+    ) -> ModuleResult<()> {
+        let reply = controller.handle(caller, operation, now);
         let (payload, created) = match reply {
             Ok(reply) => (reply.payload, reply.created),
             Err(error) => (error.payload(), None),
         };
-        let completion = self.runtime.send(Command::Complete {
+        let completion = runtime.send(Command::Complete {
             request: id,
             payload,
         });
         if !matches!(completion, Ok(Response::Ok)) {
-            self.lock_controller()?.rollback(caller, created);
+            controller.rollback(caller, created);
             if !matches!(&completion, Ok(Response::Error { code, .. }) if code == "request_ended" || code == "not_found")
             {
                 return Err(format!(

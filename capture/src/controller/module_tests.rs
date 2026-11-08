@@ -568,6 +568,42 @@ fn accepted_close_survives_cancellation_while_the_controller_is_busy() {
 }
 
 #[test]
+fn tick_leaves_requests_queued_while_preflight_holds_controller() {
+    use std::{sync::mpsc, time::Duration};
+    let host = Arc::new(HostFixture::default());
+    let mut module = module(Controller::new(FakeBackend::new(), settings()));
+    module.runtime = host.runtime();
+    host.polls
+        .lock()
+        .unwrap()
+        .push_back(crate::Response::Request {
+            id: 121,
+            caller: VIDEO.into(),
+            initiator: VIDEO.into(),
+            service: crate::SERVICE.into(),
+            payload: serde_json::json!({"action":"status"}),
+            remaining_ms: 1000,
+        });
+    let shared = module.controller.clone();
+    let (ready, entered) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _guard = shared.lock().unwrap();
+        ready.send(()).unwrap();
+        let _ = released.recv_timeout(Duration::from_secs(2));
+    });
+    entered.recv_timeout(Duration::from_secs(1)).unwrap();
+    module.tick().unwrap();
+    let queued = host.polls.lock().unwrap().len();
+    let _ = release.send(());
+    holder.join().unwrap();
+    assert_eq!(queued, 1);
+    module.tick().unwrap();
+    assert!(host.polls.lock().unwrap().is_empty());
+    assert_eq!(host.completed.lock().unwrap()[0]["request"], 121);
+}
+
+#[test]
 fn close_waits_for_privileged_helper_retirement_after_the_local_worker_has_joined() {
     use std::sync::atomic::AtomicBool;
     struct Receipt(AtomicBool);
