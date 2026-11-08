@@ -259,6 +259,9 @@ struct DiagnosticWindow {
     wait: DurationSamples,
     export: DurationSamples,
     snapshot: DurationSamples,
+    /// From starting a snapshot until the GPU proved the copy finished. The
+    /// encoder's conversion cannot begin earlier, so this is capture latency.
+    gpu_copy: DurationSamples,
 }
 
 impl DiagnosticWindow {
@@ -274,6 +277,7 @@ impl DiagnosticWindow {
             wait: DurationSamples::default(),
             export: DurationSamples::default(),
             snapshot: DurationSamples::default(),
+            gpu_copy: DurationSamples::default(),
         }
     }
 
@@ -307,6 +311,8 @@ struct Presenter {
     stream_id: u64,
     logger: Option<LogEmitter>,
     diagnostics: DiagnosticWindow,
+    /// When the newest snapshot began, until its GPU copy is proven complete.
+    copy_started: Option<Instant>,
 }
 
 impl Presenter {
@@ -330,6 +336,7 @@ impl Presenter {
             stream_id: 0,
             logger: None,
             diagnostics: DiagnosticWindow::new(Instant::now()),
+            copy_started: None,
         }
     }
 
@@ -356,7 +363,7 @@ impl Presenter {
         let window = std::mem::replace(&mut self.diagnostics, DiagnosticWindow::new(now));
         if let Some(logger) = &self.logger {
             let message = format!(
-                "stream={} window_us={} final_window={} snapshot_enabled={} changed={} timeouts={} publish_attempts={} sequence_gaps={} export_ahead_sequences={} empty_exports={} wait_calls={} wait_total_us={} wait_max_us={} export_calls={} export_total_us={} export_max_us={} snapshot_calls={} snapshot_total_us={} snapshot_max_us={}",
+                "stream={} window_us={} final_window={} snapshot_enabled={} changed={} timeouts={} publish_attempts={} sequence_gaps={} export_ahead_sequences={} empty_exports={} wait_calls={} wait_total_us={} wait_max_us={} export_calls={} export_total_us={} export_max_us={} snapshot_calls={} snapshot_total_us={} snapshot_max_us={} gpu_copy_calls={} gpu_copy_total_us={} gpu_copy_max_us={}",
                 self.stream_id,
                 now.saturating_duration_since(window.started).as_micros(),
                 final_window,
@@ -376,6 +383,9 @@ impl Presenter {
                 window.snapshot.count,
                 window.snapshot.total_us,
                 window.snapshot.max_us,
+                window.gpu_copy.count,
+                window.gpu_copy.total_us,
+                window.gpu_copy.max_us,
             );
             // Emission uses the SDK's bounded nonblocking producer; loss of
             // diagnostics never blocks capture or changes frame ownership.
@@ -394,7 +404,11 @@ impl Presenter {
         self.follow_retarget();
         if let Some(snapshotter) = &mut self.snapshotter {
             match snapshotter.retire_pending() {
-                Ok(true) => {}
+                Ok(true) => {
+                    if let Some(started) = self.copy_started.take() {
+                        self.diagnostics.gpu_copy.record(started.elapsed());
+                    }
+                }
                 // Do not enter WAIT_PRESENT while our own read guard can
                 // prevent that next flip. Output was already published with
                 // its acquire fence; downstream GPU work can proceed now.
@@ -514,6 +528,7 @@ impl Presenter {
                 self.diagnostics.snapshot.record(started.elapsed());
                 match snapshot {
                     Ok(snapshot) => {
+                        self.copy_started = Some(started);
                         self.frames.store_snapshot(snapshot, stream_sequence);
                         self.diagnostics.publish_attempts =
                             self.diagnostics.publish_attempts.saturating_add(1);
