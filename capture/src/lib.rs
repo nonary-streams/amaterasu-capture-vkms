@@ -198,10 +198,14 @@ impl ManagedModule for CaptureModule {
             }
         };
         let retained_result = crate::leases::retirement_ready().map_err(str::to_owned);
+        let snapshots_retired = crate::snapshot::retirement_ready().map_err(str::to_owned)?;
         let callbacks_retired = callbacks_result?;
         let retained_frames_retired = retained_result?;
         pending_result?;
-        Ok(callbacks_retired && retained_frames_retired && self.pending_closes.is_empty())
+        Ok(callbacks_retired
+            && retained_frames_retired
+            && snapshots_retired
+            && self.pending_closes.is_empty())
     }
 }
 

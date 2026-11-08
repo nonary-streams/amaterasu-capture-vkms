@@ -14,6 +14,16 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* These imports pin source storage until the copy's fence proves completion.
+ * They are retired only on the EGL context's owning thread. */
+struct am_vkms_pending_copy {
+    bool active;
+    EGLImageKHR source, destination;
+    GLuint source_texture, destination_texture, framebuffer;
+    struct gbm_bo *buffer;
+    EGLSyncKHR completion;
+};
+
 struct am_vkms_snapshotter {
     int render_fd;
     struct gbm_device *gbm;
@@ -23,11 +33,17 @@ struct am_vkms_snapshotter {
     PFNEGLCREATEIMAGEKHRPROC create_image;
     PFNEGLDESTROYIMAGEKHRPROC destroy_image;
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC bind_image;
+    PFNEGLCREATESYNCKHRPROC create_sync;
+    PFNEGLDESTROYSYNCKHRPROC destroy_sync;
+    PFNEGLCLIENTWAITSYNCKHRPROC client_wait_sync;
+    PFNEGLDUPNATIVEFENCEFDANDROIDPROC duplicate_fence;
+    PFNEGLWAITSYNCKHRPROC wait_sync;
     GLuint program;
     GLint position;
     GLint coordinates;
     GLint sampler;
     bool modifiers;
+    struct am_vkms_pending_copy pending;
 };
 
 static bool extension(const char *extensions, const char *name) {
@@ -103,6 +119,15 @@ static bool initialize(struct am_vkms_snapshotter *snapshotter) {
     snapshotter->bind_image = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
     if (snapshotter->create_image == NULL || snapshotter->destroy_image == NULL ||
         snapshotter->bind_image == NULL) return false;
+    if (!extension(extensions, "EGL_ANDROID_native_fence_sync") ||
+        !extension(extensions, "EGL_KHR_wait_sync")) return false;
+    snapshotter->create_sync = (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
+    snapshotter->destroy_sync = (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
+    snapshotter->client_wait_sync = (PFNEGLCLIENTWAITSYNCKHRPROC)eglGetProcAddress("eglClientWaitSyncKHR");
+    snapshotter->duplicate_fence = (PFNEGLDUPNATIVEFENCEFDANDROIDPROC)eglGetProcAddress("eglDupNativeFenceFDANDROID");
+    snapshotter->wait_sync = (PFNEGLWAITSYNCKHRPROC)eglGetProcAddress("eglWaitSyncKHR");
+    if (!snapshotter->create_sync || !snapshotter->destroy_sync || !snapshotter->client_wait_sync ||
+        !snapshotter->duplicate_fence || !snapshotter->wait_sync) return false;
     const EGLint attributes[] = {
         EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
         EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_NONE
@@ -222,6 +247,39 @@ static struct gbm_bo *allocate_snapshot(struct gbm_device *device,
     return NULL;
 }
 
+static void retire_copy(struct am_vkms_snapshotter *snapshotter) {
+    struct am_vkms_pending_copy *copy = &snapshotter->pending;
+    if (copy->completion != EGL_NO_SYNC_KHR)
+        snapshotter->destroy_sync(snapshotter->display, copy->completion);
+    glDeleteFramebuffers(1, &copy->framebuffer);
+    glDeleteTextures(1, &copy->source_texture);
+    glDeleteTextures(1, &copy->destination_texture);
+    snapshotter->destroy_image(snapshotter->display, copy->destination);
+    snapshotter->destroy_image(snapshotter->display, copy->source);
+    gbm_bo_destroy(copy->buffer);
+    memset(copy, 0, sizeof(*copy));
+}
+
+int am_vkms_snapshot_poll(struct am_vkms_snapshotter *snapshotter, uint64_t timeout_ns) {
+    if (snapshotter == NULL) return -2;
+    if (!snapshotter->pending.active) return 1;
+    if (eglMakeCurrent(snapshotter->display, snapshotter->surface, snapshotter->surface,
+                       snapshotter->context) != EGL_TRUE) return -2;
+    if (snapshotter->pending.completion != EGL_NO_SYNC_KHR) {
+        EGLint result = snapshotter->client_wait_sync(snapshotter->display,
+            snapshotter->pending.completion, 0, timeout_ns);
+        if (result == EGL_TIMEOUT_EXPIRED_KHR) return 0;
+        if (result != EGL_CONDITION_SATISFIED_KHR) return -2;
+    } else {
+        /* A failed fence creation cannot report a completed presentation.
+         * This drain is confined to failed-copy retirement/teardown. */
+        glFinish();
+        if (glGetError() != GL_NO_ERROR) return -2;
+    }
+    retire_copy(snapshotter);
+    return 1;
+}
+
 int am_vkms_snapshot_copy(struct am_vkms_snapshotter *snapshotter,
                           const struct am_vkms_snapshot_input *input,
                           struct am_vkms_snapshot_output *output) {
@@ -231,8 +289,9 @@ int am_vkms_snapshot_copy(struct am_vkms_snapshotter *snapshotter,
     output->fd = -1;
     output->pitch = 0;
     output->fourcc = 0;
-    output->reserved = 0;
+    output->completion_fd = -1;
     output->modifier = DRM_FORMAT_MOD_INVALID;
+    if (snapshotter->pending.active) return -3;
     /* Keep the source's RGB precision. Ten-bit storage does not imply HDR:
      * transfer function and primaries remain the caller's separate contract.
      * Never fall back from a ten-bit source to an eight-bit destination. */
@@ -256,12 +315,26 @@ int am_vkms_snapshot_copy(struct am_vkms_snapshotter *snapshotter,
     }
     for (uint32_t plane = 0; plane < input->plane_count; ++plane)
         if (input->fds[plane] < 0 || input->pitches[plane] == 0 ||
-            input->pitches[plane] > INT32_MAX || input->offsets[plane] > INT32_MAX) return -1;
+            input->pitches[plane] > INT32_MAX || input->offsets[plane] > INT32_MAX ||
+            input->acquire_fences[plane] < -1) return -1;
     if (eglMakeCurrent(snapshotter->display, snapshotter->surface, snapshotter->surface,
                        snapshotter->context) != EGL_TRUE) return -2;
     /* This private context has no external state. A lost context must fail
      * rather than loop indefinitely while clearing its error flag. */
     if (glGetError() != GL_NO_ERROR) return -2;
+    /* Import dependencies into the GPU queue; do not wait for source readiness
+     * on the capture thread. EGL owns only our duplicated sync_file. */
+    for (uint32_t plane = 0; plane < input->plane_count; ++plane) {
+        if (input->acquire_fences[plane] < 0) continue;
+        int fd = fcntl(input->acquire_fences[plane], F_DUPFD_CLOEXEC, 0);
+        if (fd < 0) return -2;
+        const EGLint attributes[] = {EGL_SYNC_NATIVE_FENCE_FD_ANDROID, fd, EGL_NONE};
+        EGLSyncKHR sync = snapshotter->create_sync(snapshotter->display, EGL_SYNC_NATIVE_FENCE_ANDROID, attributes);
+        if (sync == EGL_NO_SYNC_KHR) { close(fd); return -2; }
+        EGLBoolean queued = snapshotter->wait_sync(snapshotter->display, sync, 0);
+        snapshotter->destroy_sync(snapshotter->display, sync);
+        if (queued != EGL_TRUE) return -2;
+    }
     EGLImageKHR source = import_image(snapshotter, input);
     if (source == EGL_NO_IMAGE_KHR) return -1;
     struct gbm_bo *buffer = allocate_snapshot(snapshotter->gbm, input->width,
@@ -322,10 +395,35 @@ int am_vkms_snapshot_copy(struct am_vkms_snapshotter *snapshotter,
     glEnableVertexAttribArray((GLuint)snapshotter->position);
     glEnableVertexAttribArray((GLuint)snapshotter->coordinates);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    /* A completed private allocation has no producer that can overwrite it.
-     * The exported DMA-BUF owns storage beyond deletion of its temporary BO. */
-    glFinish();
+    snapshotter->pending = (struct am_vkms_pending_copy) {
+        .active = true, .source = source, .destination = destination,
+        .source_texture = source_texture, .destination_texture = destination_texture,
+        .framebuffer = framebuffer, .buffer = buffer, .completion = EGL_NO_SYNC_KHR,
+    };
+    /* Move all GPU imports into the pending read before any fallible fence
+     * operation. A failure cannot release the compositor's storage early. */
+    source = destination = EGL_NO_IMAGE_KHR;
+    source_texture = destination_texture = framebuffer = 0;
+    buffer = NULL;
+    if (snapshotter->create_sync != NULL) {
+        snapshotter->pending.completion = snapshotter->create_sync(snapshotter->display,
+            EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
+        if (snapshotter->pending.completion != EGL_NO_SYNC_KHR) {
+            glFlush();
+            output->completion_fd = snapshotter->duplicate_fence(snapshotter->display,
+                snapshotter->pending.completion);
+            if (output->completion_fd >= 0 &&
+                fcntl(output->completion_fd, F_SETFD, FD_CLOEXEC) != 0) {
+                close(output->completion_fd);
+                output->completion_fd = -1;
+            }
+        }
+    }
     if (glGetError() != GL_NO_ERROR) { result = -2; goto cleanup; }
+    if (output->completion_fd < 0) {
+        result = -2;
+        goto cleanup;
+    }
     output->fd = destination_fd;
     output->pitch = destination_input.pitches[0];
     output->fourcc = destination_input.fourcc;
@@ -337,7 +435,7 @@ cleanup:
     if (source_texture != 0) glDeleteTextures(1, &source_texture);
     if (destination_texture != 0) glDeleteTextures(1, &destination_texture);
     if (destination != EGL_NO_IMAGE_KHR) snapshotter->destroy_image(snapshotter->display, destination);
-    snapshotter->destroy_image(snapshotter->display, source);
+    if (source != EGL_NO_IMAGE_KHR) snapshotter->destroy_image(snapshotter->display, source);
     if (destination_fd >= 0) close(destination_fd);
     if (buffer != NULL) gbm_bo_destroy(buffer);
     return result;
@@ -345,6 +443,9 @@ cleanup:
 
 void am_vkms_snapshot_destroy(struct am_vkms_snapshotter *snapshotter) {
     if (snapshotter == NULL) return;
+    /* Rust normally drains first. Never free imports with an unproven read. */
+    if (snapshotter->pending.active && am_vkms_snapshot_poll(snapshotter, 1000000000u) != 1)
+        return;
     if (snapshotter->display != EGL_NO_DISPLAY && snapshotter->context != EGL_NO_CONTEXT &&
         snapshotter->surface != EGL_NO_SURFACE) {
         (void)eglMakeCurrent(snapshotter->display, snapshotter->surface, snapshotter->surface,

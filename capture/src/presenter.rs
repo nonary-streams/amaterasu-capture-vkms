@@ -392,6 +392,19 @@ impl Presenter {
     /// Waits for one newer presentation and stores it.
     fn step(&mut self) -> Next {
         self.follow_retarget();
+        if let Some(snapshotter) = &mut self.snapshotter {
+            match snapshotter.retire_pending() {
+                Ok(true) => {}
+                // Do not enter WAIT_PRESENT while our own read guard can
+                // prevent that next flip. Output was already published with
+                // its acquire fence; downstream GPU work can proceed now.
+                Ok(false) => return Next::Pause(Duration::from_micros(250)),
+                Err(_) => {
+                    self.frames.set_fault(StreamFault::GpuSnapshotFailed);
+                    return Next::Exit;
+                }
+            }
+        }
         self.frames.expire_direct_frame(std::time::Instant::now());
         let wait_ms = if self.producer_held && self.snapshotter.is_none() {
             DIRECT_WAIT_TIMEOUT_MS

@@ -1,7 +1,8 @@
 //! Optional immutable GPU snapshots for asynchronous frame leases.
 //!
 //! The driver exports mutable compositor storage. This adapter copies it into
-//! a fresh render-node allocation and waits for the GPU copy to complete. The
+//! a fresh render-node allocation and publishes its GPU completion fence. The
+//! source and its read guards stay pinned until that copy completes. The
 //! exported allocation is never reused or written by this provider afterward.
 //! RGB8 remains eight-bit RGB and RGB10 remains ten-bit RGB, using an equivalent
 //! channel layout supported by the render node. Driver import or
@@ -10,11 +11,22 @@
 use amaterasu_media::MEDIA_UNSUPPORTED;
 use amaterasu_module_sdk::abi::Status;
 use amaterasu_vkms_frame_helper::client::ExportedFrame;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static QUARANTINED_SNAPSHOTS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn retirement_ready() -> Result<bool, &'static str> {
+    if QUARANTINED_SNAPSHOTS.load(Ordering::Acquire) != 0 {
+        Err("VKMS snapshot retirement is blocked by unproven GPU reads")
+    } else {
+        Ok(true)
+    }
+}
 
 #[cfg(amaterasu_vkms_gpu_snapshot)]
 mod platform {
     use super::*;
-    use amaterasu_media::{DMABUF_MAX_DIMENSION, MEDIA_BACKEND_ERROR};
+    use amaterasu_media::{DMABUF_MAX_DIMENSION, MEDIA_BACKEND_ERROR, MEDIA_BUSY};
     use amaterasu_vkms_frame_helper::protocol::{FrameDescriptor, MAX_PLANES};
     use std::{
         ffi::c_void,
@@ -22,10 +34,7 @@ mod platform {
         os::fd::{AsRawFd, FromRawFd, OwnedFd},
         ptr::NonNull,
         rc::Rc,
-        time::{Duration, Instant},
     };
-
-    const ACQUIRE_TIMEOUT: Duration = Duration::from_millis(1_000);
 
     #[repr(C)]
     struct Input {
@@ -37,6 +46,7 @@ mod platform {
         fds: [i32; MAX_PLANES],
         pitches: [u32; MAX_PLANES],
         offsets: [u32; MAX_PLANES],
+        acquire_fences: [i32; MAX_PLANES],
     }
 
     #[repr(C)]
@@ -44,11 +54,11 @@ mod platform {
         fd: i32,
         pitch: u32,
         fourcc: u32,
-        reserved: u32,
+        completion_fd: i32,
         modifier: u64,
     }
 
-    const _: () = assert!(std::mem::size_of::<Input>() == 72);
+    const _: () = assert!(std::mem::size_of::<Input>() == 88);
     const _: () = assert!(std::mem::size_of::<Output>() == 24);
 
     unsafe extern "C" {
@@ -59,41 +69,52 @@ mod platform {
             output: *mut Output,
         ) -> i32;
         fn am_vkms_snapshot_destroy(snapshotter: *mut c_void);
+        fn am_vkms_snapshot_poll(snapshotter: *mut c_void, timeout_ns: u64) -> i32;
     }
 
     /// A thread-confined EGL context. Create, copy, and drop on one thread.
     pub struct Snapshotter {
         context: NonNull<c_void>,
+        pending_source: Option<ExportedFrame>,
         _thread_confined: PhantomData<Rc<()>>,
     }
 
     impl Snapshotter {
         pub fn new() -> Result<Self, Status> {
+            retirement_ready().map_err(|_| MEDIA_BACKEND_ERROR)?;
             // SAFETY: this call takes no pointers and returns a unique context
             // which is destroyed exactly once by Drop on the same thread.
             let context =
                 NonNull::new(unsafe { am_vkms_snapshot_create() }).ok_or(MEDIA_UNSUPPORTED)?;
             Ok(Self {
                 context,
+                pending_source: None,
                 _thread_confined: PhantomData,
             })
         }
 
         pub fn snapshot(&mut self, exported: ExportedFrame) -> Result<ExportedFrame, Status> {
+            if !self.retire_pending()? {
+                return Err(MEDIA_BUSY);
+            }
             let input = Input::from_export(&exported)?;
-            wait_for_acquire(&exported, ACQUIRE_TIMEOUT)?;
+            let source_descriptor = exported.descriptor;
             let mut output = Output {
                 fd: -1,
                 pitch: 0,
                 fourcc: 0,
-                reserved: 0,
+                completion_fd: -1,
                 modifier: amaterasu_media::DRM_FORMAT_MOD_INVALID,
             };
             // SAFETY: both records have the C layout in gpu_snapshot.h. Input
-            // descriptors remain owned by `exported` throughout this synchronous
-            // copy. The C adapter retains no Rust pointers and owns its context.
+            // descriptors remain owned by pending_source until native polling
+            // proves the read complete and destroys the temporary imports.
+            // The C adapter retains no Rust pointers and owns its context.
             let status =
                 unsafe { am_vkms_snapshot_copy(self.context.as_ptr(), &input, &mut output) };
+            // Even a failed enqueue can have outstanding GPU reads. Register
+            // ownership before inspecting its result or any returned descriptor.
+            self.pending_source = Some(exported);
             // A returned descriptor is always consumed, including malformed or
             // failed outcomes, so no error path leaks a native allocation.
             let owned = if output.fd >= 0 {
@@ -103,25 +124,70 @@ mod platform {
             } else {
                 None
             };
+            let completion = if output.completion_fd >= 0 {
+                // SAFETY: native fence export transfers a distinct owned fd.
+                Some(unsafe { OwnedFd::from_raw_fd(output.completion_fd) })
+            } else {
+                None
+            };
             if status != 0 {
+                self.retire_pending()?;
                 return Err(if status == -1 {
                     MEDIA_UNSUPPORTED
                 } else {
                     MEDIA_BACKEND_ERROR
                 });
             }
-            let descriptor = copied_descriptor(exported.descriptor, &output)?;
+            let descriptor = copied_descriptor(source_descriptor, &output)?;
+            // Queued copies retain the source independently of the output lease.
+            // Polling only reclaims imports that have already completed.
+            self.retire_pending()?;
             Ok(ExportedFrame {
                 descriptor,
                 dma_bufs: vec![owned.ok_or(MEDIA_BACKEND_ERROR)?],
                 read_guards: Vec::new(),
-                fences: Default::default(),
+                fences: [completion, None, None, None],
             })
+        }
+
+        /// Poll before entering WAIT_PRESENT: a retained source guard may be
+        /// exactly what prevents the compositor from completing that next flip.
+        pub fn retire_pending(&mut self) -> Result<bool, Status> {
+            self.retire_with_timeout(0)
+        }
+
+        fn retire_with_timeout(&mut self, timeout_ns: u64) -> Result<bool, Status> {
+            if self.pending_source.is_none() {
+                return Ok(true);
+            }
+            // SAFETY: this context and its pending imports belong to this
+            // thread; zero timeout never waits for GPU execution.
+            let status = unsafe { am_vkms_snapshot_poll(self.context.as_ptr(), timeout_ns) };
+            retire_source(&mut self.pending_source, status)
+        }
+    }
+
+    fn retire_source<T>(source: &mut Option<T>, native_status: i32) -> Result<bool, Status> {
+        match native_status {
+            1 => {
+                source.take();
+                Ok(true)
+            }
+            0 => Ok(false),
+            _ => Err(MEDIA_BACKEND_ERROR),
         }
     }
 
     impl Drop for Snapshotter {
         fn drop(&mut self) {
+            // Only teardown can wait, and the native fence wait is bounded.
+            // A failed proof pins the context, imports and original driver
+            // guards for the process lifetime and blocks provider retirement.
+            if self.retire_with_timeout(1_000_000_000) != Ok(true) {
+                QUARANTINED_SNAPSHOTS.fetch_add(1, Ordering::AcqRel);
+                std::mem::forget(self.pending_source.take());
+                return;
+            }
             // SAFETY: this is the sole owner of the native context and the
             // !Send marker keeps destruction on its creating thread.
             unsafe { am_vkms_snapshot_destroy(self.context.as_ptr()) };
@@ -158,6 +224,11 @@ mod platform {
                 fds,
                 pitches: descriptor.pitches,
                 offsets: descriptor.offsets,
+                acquire_fences: std::array::from_fn(|plane| {
+                    exported.fences[plane]
+                        .as_ref()
+                        .map_or(-1, AsRawFd::as_raw_fd)
+                }),
             })
         }
     }
@@ -168,7 +239,7 @@ mod platform {
     ) -> Result<FrameDescriptor, Status> {
         let source_precision = rgb_precision(source.fourcc).ok_or(MEDIA_UNSUPPORTED)?;
         if output.fd < 0
-            || output.reserved != 0
+            || output.completion_fd < -1
             || rgb_precision(output.fourcc) != Some(source_precision)
             || output.pitch < source.width.checked_mul(4).ok_or(MEDIA_BACKEND_ERROR)?
         {
@@ -180,7 +251,7 @@ mod platform {
             plane_count: 1,
             pitches: [output.pitch, 0, 0, 0],
             offsets: [0; MAX_PLANES],
-            fence_mask: 0,
+            fence_mask: u32::from(output.completion_fd >= 0),
             guard_count: 0,
             ..source
         };
@@ -206,45 +277,6 @@ mod platform {
         } else {
             None
         }
-    }
-
-    fn wait_for_acquire(exported: &ExportedFrame, timeout: Duration) -> Result<(), Status> {
-        let deadline = Instant::now() + timeout;
-        for fence in exported.fences.iter().flatten() {
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(MEDIA_BACKEND_ERROR);
-                }
-                let mut record = libc::pollfd {
-                    fd: fence.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let millis = remaining
-                    .as_millis()
-                    .saturating_add(1)
-                    .min(i32::MAX as u128) as i32;
-                // SAFETY: poll reads and writes exactly one live pollfd. The
-                // borrowed fence remains owned by `exported` for this wait.
-                let result = unsafe { libc::poll(&mut record, 1, millis) };
-                if result > 0 {
-                    if record.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
-                        || record.revents & libc::POLLIN == 0
-                    {
-                        return Err(MEDIA_BACKEND_ERROR);
-                    }
-                    break;
-                }
-                if result == 0 {
-                    return Err(MEDIA_BACKEND_ERROR);
-                }
-                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-                    return Err(MEDIA_BACKEND_ERROR);
-                }
-            }
-        }
-        Ok(())
     }
 
     #[cfg(test)]
@@ -280,7 +312,7 @@ mod platform {
                     fd: 8,
                     pitch: 32,
                     fourcc: u32::from_le_bytes(*b"XR24"),
-                    reserved: 0,
+                    completion_fd: -1,
                     modifier: 0,
                 },
             )
@@ -298,7 +330,7 @@ mod platform {
                         fd: -1,
                         pitch: 16,
                         fourcc: u32::from_le_bytes(*b"XR24"),
-                        reserved: 0,
+                        completion_fd: -1,
                         modifier: 0
                     }
                 )
@@ -311,7 +343,7 @@ mod platform {
                         fd: 8,
                         pitch: 8,
                         fourcc: u32::from_le_bytes(*b"XR24"),
-                        reserved: 0,
+                        completion_fd: -1,
                         modifier: 0
                     }
                 )
@@ -334,7 +366,7 @@ mod platform {
                         fd: 8,
                         pitch: 32,
                         fourcc: u32::from_le_bytes(destination),
-                        reserved: 0,
+                        completion_fd: -1,
                         modifier: 0,
                     };
                     assert_eq!(
@@ -363,7 +395,7 @@ mod platform {
                     fd: 8,
                     pitch: 32,
                     fourcc: u32::from_le_bytes(format),
-                    reserved: 0,
+                    completion_fd: -1,
                     modifier: 0,
                 };
                 assert_eq!(
@@ -385,56 +417,47 @@ mod platform {
         }
 
         #[test]
-        fn acquire_wait_accepts_multiple_completed_planes() {
-            // SAFETY: eventfd returns a new descriptor owned by this test.
-            let raw = unsafe { libc::eventfd(1, libc::EFD_CLOEXEC) };
-            assert!(raw >= 0);
-            // SAFETY: successful eventfd transfers ownership of this descriptor.
-            let ready = unsafe { OwnedFd::from_raw_fd(raw) };
-            let second = ready.try_clone().unwrap();
-            let exported = ExportedFrame {
-                descriptor: source(),
-                dma_bufs: vec![],
-                read_guards: Vec::new(),
-                fences: [Some(ready), Some(second), None, None],
-            };
-            assert!(wait_for_acquire(&exported, Duration::from_millis(10)).is_ok());
+        fn pending_source_is_released_only_after_proven_completion() {
+            let mut source = Some(std::sync::Arc::new(()));
+            let observer = source.as_ref().unwrap().clone();
+            assert_eq!(retire_source(&mut source, 0), Ok(false));
+            assert_eq!(retire_source(&mut source, -2), Err(MEDIA_BACKEND_ERROR));
+            assert_eq!(std::sync::Arc::strong_count(&observer), 2);
+            assert_eq!(retire_source(&mut source, 1), Ok(true));
+            assert_eq!(std::sync::Arc::strong_count(&observer), 1);
         }
-
         #[test]
-        fn acquire_wait_checks_every_plane_and_times_out_unsignaled_fence() {
-            // SAFETY: eventfd returns new descriptors owned by this test.
-            let ready = unsafe { libc::eventfd(1, libc::EFD_CLOEXEC) };
-            let blocked = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
-            assert!(ready >= 0 && blocked >= 0);
-            // SAFETY: the two successful eventfd calls transferred ownership.
-            let fences = unsafe {
-                [
-                    Some(OwnedFd::from_raw_fd(ready)),
-                    Some(OwnedFd::from_raw_fd(blocked)),
-                    None,
-                    None,
-                ]
-            };
+        fn acquire_dependency_is_forwarded_without_waiting() {
+            let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+            assert!(raw >= 0);
+            let fence = unsafe { OwnedFd::from_raw_fd(raw) };
+            let fd = fence.try_clone().unwrap();
+            let mut descriptor = source();
+            descriptor.fence_mask = 1;
             let exported = ExportedFrame {
-                descriptor: source(),
-                dma_bufs: vec![],
-                read_guards: Vec::new(),
-                fences,
+                descriptor,
+                dma_bufs: vec![fd],
+                read_guards: vec![],
+                fences: [Some(fence), None, None, None],
             };
-            assert!(wait_for_acquire(&exported, Duration::from_millis(1)).is_err());
+            let input = Input::from_export(&exported).unwrap();
+            assert_eq!(
+                input.acquire_fences[0],
+                exported.fences[0].as_ref().unwrap().as_raw_fd()
+            );
+            assert_eq!(input.acquire_fences[1..], [-1; 3]);
         }
     }
 }
-
-#[cfg(amaterasu_vkms_gpu_snapshot)]
-pub use platform::Snapshotter;
-
 #[cfg(not(amaterasu_vkms_gpu_snapshot))]
 pub struct Snapshotter;
 
 #[cfg(not(amaterasu_vkms_gpu_snapshot))]
 impl Snapshotter {
+    pub fn retire_pending(&mut self) -> Result<bool, Status> {
+        Ok(true)
+    }
+
     pub fn new() -> Result<Self, Status> {
         Err(MEDIA_UNSUPPORTED)
     }
@@ -443,3 +466,6 @@ impl Snapshotter {
         Err(MEDIA_UNSUPPORTED)
     }
 }
+
+#[cfg(amaterasu_vkms_gpu_snapshot)]
+pub use platform::Snapshotter;
