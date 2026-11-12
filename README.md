@@ -138,3 +138,17 @@ Protocol 4 carries native GPU DMA-BUFs and separate driver read guards. The
 helper verifies that both exports describe the same presentation. Consumers
 retain the guards through source GPU completion; snapshots then retain only
 their independent allocation. This preserves NVIDIA import compatibility.
+
+## Continuous integration and releases
+
+Both crates carry their own lockfile and pin the SDK by commit in their
+manifests, so they build from this repository alone. Continuous integration
+formats, tests and lints the helper and the capture module on Linux, Windows
+and macOS, and repeats the capture module's tests with every feature on Linux.
+
+Pushing a tag `vX.Y.Z` that matches the version in `capture/Cargo.toml` builds
+the capture library and the helper for Linux, attests where they were built,
+and publishes them as a GitHub release. A host installs this module as part of
+the signed Amaterasu Core set; a release here is not an installable package on
+its own. `metadata/module.json` describes the module and where the host mounts
+it.

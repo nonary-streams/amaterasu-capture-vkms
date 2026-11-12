@@ -1,0 +1,42 @@
+name: Module
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --manifest-path helper-wire/Cargo.toml --all --check
+      - run: cargo test --manifest-path helper-wire/Cargo.toml --locked
+      - run: cargo clippy --manifest-path helper-wire/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo fmt --manifest-path capture/Cargo.toml --all --check
+      - run: cargo test --manifest-path capture/Cargo.toml --locked
+      - run: cargo clippy --manifest-path capture/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Test with every Linux feature
+        if: runner.os == 'Linux'
+        run: cargo test --manifest-path capture/Cargo.toml --locked --all-features
+      - name: Lint with every Linux feature
+        if: runner.os == 'Linux'
+        run: cargo clippy --manifest-path capture/Cargo.toml --locked --all-features --all-targets -- -D warnings

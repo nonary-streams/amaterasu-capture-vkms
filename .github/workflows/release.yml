@@ -1,0 +1,73 @@
+name: Release
+
+# Pushing a tag such as v0.2.0 builds the capture module and its helper for
+# Linux, records where they were built, and publishes them as a release. The
+# tag must equal the version in capture/Cargo.toml.
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Check the tag against the module version
+        run: python scripts/release-version.py "${GITHUB_REF_NAME#v}"
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --manifest-path helper-wire/Cargo.toml --locked --release
+      - run: cargo test --manifest-path capture/Cargo.toml --locked --release
+      - run: cargo build --manifest-path helper-wire/Cargo.toml --locked --release
+      - run: cargo build --manifest-path capture/Cargo.toml --locked --release
+      - name: Record what was built
+        run: |
+          mkdir -p dist/linux-x86_64
+          cp capture/target/release/libamaterasu_capture_vkms.so dist/linux-x86_64/
+          cp helper-wire/target/release/amaterasu-vkms-frame-helper dist/linux-x86_64/
+          cp metadata/module.json LICENSE dist/linux-x86_64/
+          cd dist/linux-x86_64
+          sha256sum * > SHA256SUMS
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/linux-x86_64/*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-x86_64
+          path: dist/linux-x86_64
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="${GITHUB_REPOSITORY#*/}-${GITHUB_REF_NAME#v}"
+          tar -C dist/linux-x86_64 -czf "$name-linux-x86_64.tar.gz" .
+          sha256sum "$name"-*.tar.gz > "$name-SHA256SUMS"
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+            "$name"-*.tar.gz "$name-SHA256SUMS"

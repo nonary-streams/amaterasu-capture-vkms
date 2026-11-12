@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "family": "capture",
+  "repository": "https://github.com/nonary-streams/amaterasu-capture-vkms",
+  "mount": "modules/capture-vkms",
+  "components": [
+    {
+      "id": "amaterasu.capture-vkms",
+      "package": "amaterasu-capture-vkms",
+      "path": "capture",
+      "name": "Virtual display capture",
+      "summary": "Captures the stream's virtual display without copying frames."
+    }
+  ]
+}

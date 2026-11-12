@@ -3,6 +3,8 @@ name = "amaterasu-vkms-frame-helper"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/nonary-streams/amaterasu-capture-vkms"
 [features]
 # Experimental protocol 4 needs the matching, separately qualified driver.
 driver-read-leases = []
