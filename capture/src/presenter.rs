@@ -7,8 +7,8 @@
 //! helper, so frames become available at the compositor's presentation rate,
 //! including variable refresh, instead of being sampled on a fixed timer.
 use crate::{
-    frames::{StreamFault, StreamFrames},
-    snapshot::Snapshotter,
+    frames::{Presented, StreamFault, StreamFrames},
+    snapshot::{CopyWork, FrameSnapshotter, SnapshotOutcome, Snapshotter},
 };
 use amaterasu_module_sdk::{LogEmitter, LogLevel};
 use amaterasu_vkms_frame_helper::{
@@ -32,6 +32,9 @@ pub const PRESENT_WAIT_TIMEOUT_MS: u32 = 100;
 // Poll direct sources promptly after a reader requests a frame and to expire
 // unclaimed mailbox leases, without waiting for a blocked presentation.
 const DIRECT_WAIT_TIMEOUT_MS: u32 = 5;
+/// While a presentation waits for a free snapshot buffer, poll for one this
+/// often so the latest presentation is not stranded on an idle compositor.
+const SNAPSHOT_RETRY_WAIT_TIMEOUT_MS: u32 = 2;
 /// Pause after the driver reported `busy` or `interrupted`.
 const RETRY_DELAY: Duration = Duration::from_millis(5);
 /// Pause while the CRTC is gone and the controller re-resolves the output.
@@ -74,6 +77,11 @@ pub trait SourceInterrupt: Send + Sync {
     fn interrupt(&self);
 }
 
+/// Creates a stream's snapshotter on its presentation thread.
+pub(crate) type SnapshotterFactory = Box<
+    dyn FnOnce() -> Result<Box<dyn FrameSnapshotter>, amaterasu_module_sdk::abi::Status> + Send,
+>;
+
 /// Owns one stream's presentation thread. Dropping it stops the thread.
 pub struct PresentationThread {
     stop: Arc<AtomicBool>,
@@ -98,6 +106,23 @@ impl PresentationThread {
         stream_id: u64,
         logger: Option<LogEmitter>,
     ) -> io::Result<Self> {
+        let snapshotter: Option<SnapshotterFactory> = gpu_snapshot.then(|| {
+            Box::new(|| {
+                Snapshotter::new()
+                    .map(|snapshotter| Box::new(snapshotter) as Box<dyn FrameSnapshotter>)
+            }) as SnapshotterFactory
+        });
+        Self::spawn_with_snapshotter(source, frames, snapshotter, stream_id, logger)
+    }
+
+    /// The snapshotter is thread-confined, so the thread itself creates it.
+    pub(crate) fn spawn_with_snapshotter(
+        source: Box<dyn FrameSource>,
+        frames: Arc<StreamFrames>,
+        snapshotter: Option<SnapshotterFactory>,
+        stream_id: u64,
+        logger: Option<LogEmitter>,
+    ) -> io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let interrupt = source.interrupter();
         let source_retirement = source.retirement();
@@ -109,16 +134,12 @@ impl PresentationThread {
             .name("vkms-presentation".into())
             .spawn(move || {
                 crate::threading::configure_capture_thread();
-                let snapshotter = if gpu_snapshot {
-                    match Snapshotter::new() {
-                        Ok(snapshotter) => Some(snapshotter),
-                        Err(_) => {
-                            let _ = ready.send(false);
-                            return;
-                        }
+                let snapshotter = match snapshotter.map(|create| create()).transpose() {
+                    Ok(snapshotter) => snapshotter,
+                    Err(_) => {
+                        let _ = ready.send(false);
+                        return;
                     }
-                } else {
-                    None
                 };
                 let mut presenter = Presenter::new(source, frames.clone(), child_stop, snapshotter);
                 presenter.stream_id = stream_id;
@@ -256,8 +277,19 @@ struct DiagnosticWindow {
     export_ahead_sequences: u64,
     empty_exports: u64,
     publish_attempts: u64,
+    /// Presentations skipped because every snapshot buffer was still retained.
+    pool_exhausted: u64,
+    /// Skipped presentations later copied once a buffer was released.
+    snapshot_retries: u64,
+    /// Copies that imported a source not found in the identity cache.
+    source_imports: u64,
+    /// Copies that (re)allocated their destination buffer.
+    slot_allocations: u64,
+    /// Copies that finished on the CPU because no native fence was available.
+    synchronous_copies: u64,
     wait: DurationSamples,
     export: DurationSamples,
+    /// Time to submit each copy; with native fences this excludes GPU work.
     snapshot: DurationSamples,
     /// From starting a snapshot until the GPU proved the copy finished. The
     /// encoder's conversion cannot begin earlier, so this is capture latency.
@@ -274,6 +306,11 @@ impl DiagnosticWindow {
             export_ahead_sequences: 0,
             empty_exports: 0,
             publish_attempts: 0,
+            pool_exhausted: 0,
+            snapshot_retries: 0,
+            source_imports: 0,
+            slot_allocations: 0,
+            synchronous_copies: 0,
             wait: DurationSamples::default(),
             export: DurationSamples::default(),
             snapshot: DurationSamples::default(),
@@ -292,6 +329,26 @@ impl DiagnosticWindow {
             .export_ahead_sequences
             .saturating_add(exported.saturating_sub(waited));
     }
+
+    fn observe_copy(&mut self, work: CopyWork, retried: bool) {
+        self.snapshot_retries = self.snapshot_retries.saturating_add(u64::from(retried));
+        self.source_imports = self
+            .source_imports
+            .saturating_add(u64::from(work.source_imported));
+        self.slot_allocations = self
+            .slot_allocations
+            .saturating_add(u64::from(work.slot_allocated));
+        self.synchronous_copies = self
+            .synchronous_copies
+            .saturating_add(u64::from(work.synchronous));
+    }
+}
+
+/// A presentation exported while every snapshot buffer was retained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingSnapshot {
+    driver_sequence: u64,
+    processing_started_host_us: u64,
 }
 
 /// The thread's state: the source and the CRTC sequence it has seen.
@@ -306,7 +363,9 @@ struct Presenter {
     /// the output moves to another CRTC with its own counter.
     sequence_base: u64,
     consecutive_driver_errors: u32,
-    snapshotter: Option<Snapshotter>,
+    snapshotter: Option<Box<dyn FrameSnapshotter>>,
+    /// Retry this presentation's copy when a snapshot buffer frees up.
+    pending_snapshot: Option<PendingSnapshot>,
     producer_held: bool,
     stream_id: u64,
     logger: Option<LogEmitter>,
@@ -320,7 +379,7 @@ impl Presenter {
         source: Box<dyn FrameSource>,
         frames: Arc<StreamFrames>,
         stop: Arc<AtomicBool>,
-        snapshotter: Option<Snapshotter>,
+        snapshotter: Option<Box<dyn FrameSnapshotter>>,
     ) -> Self {
         let producer_held = source.holds_producer();
         Self {
@@ -333,6 +392,7 @@ impl Presenter {
             sequence_base: 0,
             consecutive_driver_errors: 0,
             snapshotter,
+            pending_snapshot: None,
             stream_id: 0,
             logger: None,
             diagnostics: DiagnosticWindow::new(Instant::now()),
@@ -363,7 +423,7 @@ impl Presenter {
         let window = std::mem::replace(&mut self.diagnostics, DiagnosticWindow::new(now));
         if let Some(logger) = &self.logger {
             let message = format!(
-                "stream={} window_us={} final_window={} snapshot_enabled={} changed={} timeouts={} publish_attempts={} sequence_gaps={} export_ahead_sequences={} empty_exports={} wait_calls={} wait_total_us={} wait_max_us={} export_calls={} export_total_us={} export_max_us={} snapshot_calls={} snapshot_total_us={} snapshot_max_us={} gpu_copy_calls={} gpu_copy_total_us={} gpu_copy_max_us={}",
+                "stream={} window_us={} final_window={} snapshot_enabled={} changed={} timeouts={} publish_attempts={} sequence_gaps={} export_ahead_sequences={} empty_exports={} pool_exhausted={} snapshot_retries={} source_imports={} slot_allocations={} synchronous_copies={} wait_calls={} wait_total_us={} wait_max_us={} export_calls={} export_total_us={} export_max_us={} snapshot_calls={} snapshot_total_us={} snapshot_max_us={} gpu_copy_calls={} gpu_copy_total_us={} gpu_copy_max_us={}",
                 self.stream_id,
                 now.saturating_duration_since(window.started).as_micros(),
                 final_window,
@@ -374,6 +434,11 @@ impl Presenter {
                 window.sequence_gaps,
                 window.export_ahead_sequences,
                 window.empty_exports,
+                window.pool_exhausted,
+                window.snapshot_retries,
+                window.source_imports,
+                window.slot_allocations,
+                window.synchronous_copies,
                 window.wait.count,
                 window.wait.total_us,
                 window.wait.max_us,
@@ -420,7 +485,9 @@ impl Presenter {
             }
         }
         self.frames.expire_direct_frame(std::time::Instant::now());
-        let wait_ms = if self.producer_held && self.snapshotter.is_none() {
+        let wait_ms = if self.pending_snapshot.is_some() {
+            SNAPSHOT_RETRY_WAIT_TIMEOUT_MS
+        } else if self.producer_held && self.snapshotter.is_none() {
             DIRECT_WAIT_TIMEOUT_MS
         } else {
             PRESENT_WAIT_TIMEOUT_MS
@@ -430,6 +497,9 @@ impl Presenter {
             .source
             .wait(self.crtc_id, self.driver_sequence, wait_ms);
         self.diagnostics.wait.record(started.elapsed());
+        // Processing of this presentation starts now, before export or copy:
+        // the clock video reports to clients as host processing latency.
+        let handled_at = amaterasu_media::host_monotonic_micros();
         let presentation = match result {
             Ok(presentation) => presentation,
             Err(error) => return self.failed(&error),
@@ -441,7 +511,8 @@ impl Presenter {
         if presentation.flags & PRESENT_TIMEOUT != 0 {
             self.diagnostics.timeouts = self.diagnostics.timeouts.saturating_add(1);
         }
-        if presentation.flags & PRESENT_CHANGED == 0 && !requested {
+        let retry_snapshot = self.pending_snapshot.is_some();
+        if presentation.flags & PRESENT_CHANGED == 0 && !requested && !retry_snapshot {
             // A timeout: nothing new was presented.
             self.consecutive_driver_errors = 0;
             return Next::Continue;
@@ -473,10 +544,11 @@ impl Presenter {
         match result {
             Ok(FrameExport::Ready(exported)) => {
                 self.consecutive_driver_errors = 0;
-                self.publish(exported, presentation.sequence);
+                self.publish(exported, presentation.sequence, handled_at);
                 Next::Continue
             }
             Ok(FrameExport::Empty) => {
+                self.pending_snapshot = None;
                 self.diagnostics.empty_exports = self.diagnostics.empty_exports.saturating_add(1);
                 self.diagnostics.observe_sequence(
                     self.driver_sequence,
@@ -502,6 +574,7 @@ impl Presenter {
         }
         self.crtc_id = crtc_id;
         self.driver_sequence = 0;
+        self.pending_snapshot = None;
         self.sequence_base = self
             .frames
             .latest_presentation()
@@ -510,41 +583,78 @@ impl Presenter {
 
     /// Stores a frame newer than any stored before. FRAME returns the newest
     /// completed scanout, which may already be newer than the WAIT result;
-    /// gaps are coalesced.
-    fn publish(&mut self, exported: ExportedFrame, waited_sequence: u64) {
+    /// gaps are coalesced. `handled_at` is when this thread began handling
+    /// the presentation (host monotonic microseconds).
+    fn publish(&mut self, exported: ExportedFrame, waited_sequence: u64, handled_at: u64) {
         if self.finished() {
             return;
         }
         let exported_sequence = exported.descriptor.sequence;
         let previous = self.driver_sequence;
-        self.diagnostics
-            .observe_sequence(previous, waited_sequence, exported_sequence);
+        let pending = self.pending_snapshot.take();
+        // A retried copy of the same presentation keeps its original start.
+        let (retried, processing_started_host_us) = match pending {
+            Some(pending) if exported_sequence == pending.driver_sequence => {
+                (true, pending.processing_started_host_us)
+            }
+            _ => (false, handled_at),
+        };
+        if !retried {
+            self.diagnostics
+                .observe_sequence(previous, waited_sequence, exported_sequence);
+        }
         self.driver_sequence = previous.max(exported_sequence).max(waited_sequence);
-        if exported_sequence > previous || self.producer_held {
-            let stream_sequence = self.sequence_base.saturating_add(exported_sequence);
-            if let Some(snapshotter) = &mut self.snapshotter {
-                let started = Instant::now();
-                let snapshot = snapshotter.snapshot(exported);
+        if exported_sequence <= previous && !self.producer_held && !retried {
+            return;
+        }
+        let presented = Presented {
+            sequence: self.sequence_base.saturating_add(exported_sequence),
+            processing_started_host_us,
+        };
+        if self.snapshotter.is_some() {
+            self.publish_snapshot(exported, presented, exported_sequence, retried);
+        } else if self.producer_held {
+            self.frames
+                .store_presented_leased(exported, presented, self.crtc_id);
+            self.diagnostics.publish_attempts = self.diagnostics.publish_attempts.saturating_add(1);
+        } else {
+            self.frames.store_presented(exported, presented);
+            self.diagnostics.publish_attempts = self.diagnostics.publish_attempts.saturating_add(1);
+        }
+    }
+
+    /// Submits a private copy without waiting for the GPU. When every pool
+    /// buffer is still retained the presentation is skipped, never written
+    /// over a buffer a consumer may read, and retried on the next wakeup.
+    fn publish_snapshot(
+        &mut self,
+        exported: ExportedFrame,
+        presented: Presented,
+        driver_sequence: u64,
+        retried: bool,
+    ) {
+        let Some(snapshotter) = self.snapshotter.as_mut() else {
+            return;
+        };
+        let started = Instant::now();
+        let snapshot = snapshotter.snapshot(exported);
+        match snapshot {
+            Ok(SnapshotOutcome::Copied(snapshot)) => {
                 self.diagnostics.snapshot.record(started.elapsed());
-                match snapshot {
-                    Ok(snapshot) => {
-                        self.copy_started = Some(started);
-                        self.frames.store_snapshot(snapshot, stream_sequence);
-                        self.diagnostics.publish_attempts =
-                            self.diagnostics.publish_attempts.saturating_add(1);
-                    }
-                    Err(_) => self.frames.set_fault(StreamFault::GpuSnapshotFailed),
-                }
-            } else if self.producer_held {
-                self.frames
-                    .store_leased(exported, stream_sequence, self.crtc_id);
-                self.diagnostics.publish_attempts =
-                    self.diagnostics.publish_attempts.saturating_add(1);
-            } else {
-                self.frames.store(exported, stream_sequence);
+                self.copy_started = Some(started);
+                self.diagnostics.observe_copy(snapshot.work, retried);
+                self.frames.store_presented_snapshot(snapshot, presented);
                 self.diagnostics.publish_attempts =
                     self.diagnostics.publish_attempts.saturating_add(1);
             }
+            Ok(SnapshotOutcome::PoolExhausted) => {
+                self.diagnostics.pool_exhausted = self.diagnostics.pool_exhausted.saturating_add(1);
+                self.pending_snapshot = Some(PendingSnapshot {
+                    driver_sequence,
+                    processing_started_host_us: presented.processing_started_host_us,
+                });
+            }
+            Err(_) => self.frames.set_fault(StreamFault::GpuSnapshotFailed),
         }
     }
 

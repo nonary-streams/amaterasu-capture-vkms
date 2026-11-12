@@ -229,9 +229,29 @@ stream is `MEDIA_CLOSED`; a failed helper or permission refusal is
 Build with `--features linux-kwin-geometry,linux-gpu-snapshot` and set
 `gpu_snapshot:true`. Snapshot support requires GBM, EGL, GLES and libdrm
 development libraries, plus access to a compatible render node at runtime.
-The presentation thread waits for all input acquire fences, then renders into
-a fresh private GBM allocation and calls `glFinish` before exporting it. This
-provider never writes that allocation again. RGB8 input uses an available
+The presentation thread renders each presentation into one of four private
+GBM buffers per stream. Each buffer is allocated, imported and exported once
+per geometry/format and keeps a stable DMA-BUF identity, so downstream import
+caches can hit. Source DMA-BUFs are imported once and cached by identity
+(`st_dev`, `st_ino` and layout) for up to eight sources per stream, holding a
+duplicate descriptor so a cached identity cannot be recycled; the cache and
+the pool are released when the stream closes. Input acquire fences become
+GPU-side waits (`EGL_ANDROID_native_fence_sync` with `EGL_KHR_wait_sync`); a fence that cannot be queued fails the copy.
+
+The copy is submitted without `glFinish`. A native fence created after the draw
+is published as the snapshot's plane-0 acquire fence; consumers wait for it
+before reading (the NVENC converter queues an `eglWaitSyncKHR` or polls it, and
+the RTX HDR processor polls it). Native fences are required; unavailable or failed fences fail the copy.
+
+A buffer is rewritten only after the stored frame and every retained lease of
+it have been released; the release path has already waited for the consumer's
+completion fence (or quarantined the buffer forever). Reuse is decided by that
+lease accounting, not by DMA-BUF reference counts: a consumer may keep a
+duplicate descriptor in its own import cache after release without holding the
+buffer or delaying stream close. When all four buffers are still retained, the
+presentation is skipped rather than overwriting or waiting; the presenter then
+polls every 2 ms and copies the newest scanout once a buffer is free, keeping
+the skipped presentation's original processing start. RGB8 input uses an available
 eight-bit RGB layout. XR30, AR30, XB30 and AB30 input uses an available ten-bit
 RGB layout, a high-precision sampler and a framebuffer with at least ten bits
 per RGB component. Unsupported import or
@@ -239,8 +259,10 @@ render targets fail without reducing precision. No CPU readback occurs.
 
 Set `require_lease:true` alongside `gpu_snapshot:true` and build both provider
 and helper with `driver-read-leases` to require a driver guard during the copy.
-The temporary source import is released after GPU completion; retained consumers
-own only the private snapshot. Set `require_frame_lease:true` in the video
+Driver read guards are kept until the copy's completion fence signals, then
+released; retained consumers own only the private snapshot. A copy that does
+not complete within one second keeps its guard for the process lifetime and
+faults the stream. Set `require_frame_lease:true` in the video
 component as well to reject borrowed delivery and CPU fallback end to end.
 
 The default `gpu_snapshot:false` build advertises capture v1.5 and uses
@@ -269,9 +291,8 @@ path completes its read before release and uses `-1`.
 When a private copy is requested, its context initializes on the presentation
 thread before open succeeds; missing
 snapshot support reports `gpu_snapshot_unavailable`. A failed copy during a
-stream faults it as `gpu_snapshot_failed`. Fresh allocation and synchronous GPU
-completion favor ownership correctness; sustained cost and multi-GPU import need
-hardware measurement. Ten-bit storage is not an HDR qualification: the legacy
+stream faults it as `gpu_snapshot_failed`. Pooled storage, cached imports and
+fence-based completion still need on-GPU measurement, as does multi-GPU import. Ten-bit storage is not an HDR qualification: the legacy
 KMS frame metadata remains sRGB, and HDR colorimetry, encoder support and client
 playback remain separate unfinished gates.
 
@@ -280,8 +301,13 @@ Every ten seconds each active presentation thread emits a bounded
 changed/timeout WAIT results, publication attempts and empty exports, source-sequence gaps,
 the sequence distance by which FRAME is ahead of WAIT, and count/total/maximum microseconds for WAIT,
 FRAME export, and snapshot. WAIT includes normal time spent waiting for the
-next presentation; snapshot includes acquire-fence waiting and synchronous GPU
-copy, not separate GPU execution timings. Sequence gaps mean the presenter did
+next presentation. Snapshot measures submitting the copy: with native fences it
+excludes GPU execution, which consumers wait for through the acquire fence;
+`gpu_copy` measures time until completion is observed. `pool_exhausted` counts
+presentations skipped because every snapshot buffer was retained,
+`snapshot_retries` those later copied after a buffer freed, `source_imports`
+source identity-cache misses, `slot_allocations` destination (re)allocations
+and `synchronous_copies` remains zero. Sequence gaps mean the presenter did
 not publish every observed driver sequence, not that the game or client dropped
 that many frames. Short streams also emit a final partial window. A full log
 queue can drop a record without blocking capture.
@@ -297,8 +323,9 @@ queue can drop a record without blocking capture.
   helper exchange and the driver export, bounded to 100 ms) after WAIT returns, which is itself
   immediate on completion. The consumer then sees it on its next
   `latest_presentation` poll.
-- Snapshot mode additionally waits for input fences and GPU copy completion;
-  a stalled graphics driver can delay teardown. No bounded GPU execution time
+- Snapshot mode submits a GPU copy without waiting for it, except that driver
+  read guards are held until the copy completes and unqueueable acquire fences
+  are waited on the CPU; a stalled graphics driver can delay teardown. No bounded GPU execution time
   is claimed from the helper's socket timeout.
 - The thread stops on close, on module shutdown, and on its own when the
   stream faults. Close sets a stop flag, shuts down the stream's helper socket,
@@ -440,7 +467,13 @@ resolve it before publication.
 The `driver-read-leases` helper now uses protocol 4 and the additive
 `GET_FRAME_COLOR` ioctl (frame ABI 2). Colour interpretation and static HDR
 metadata are latched with the completed scanout. Capture v1.9 exposes that
-metadata for the owned stream. Capture v1.10 reports authoritative per-frame
+metadata for the owned stream. Capture v1.12 (retained-frame builds) adds
+`frame_timing`: the host CLOCK_MONOTONIC microseconds at which the presentation
+thread began handling a stored presentation, taken when WAIT_PRESENT returns and
+before FRAME export or snapshot copy, for the last 32 stored presentations. The
+pinned SDK revision predates v1.12, so `native/sdk_resource.rs` mirrors the host
+SDK definition and checks it field by field against `amaterasu_media.h` when
+that header is available. Capture v1.10 reports authoritative per-frame
 colour only for a guarded source with `require_lease:true`, after a verified
 frame has arrived. Other builds return no provenance claim even if they advertise
 retained frames. Consumers must still check each frame's colour and fail on
@@ -449,3 +482,7 @@ GPU snapshot; an unknown colour state or an eight-bit HDR source is refused.
 Older frame ioctls and helper protocol 1 retain their compatibility behavior.
 The corresponding driver and a 10-bit encoder are required; allocation alone
 is not an HDR qualification.
+
+The recovered pool preserves asynchronous source retirement: no CPU fence wait
+or synchronous copy fallback is used. Failed GPU completion proofs quarantine
+both source guards and the destination claim and block provider retirement.

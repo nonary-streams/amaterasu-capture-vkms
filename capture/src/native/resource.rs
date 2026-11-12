@@ -303,6 +303,9 @@ pub(super) unsafe extern "C" fn read<B: Backend>(
                 size_of::<DmaBufFrame>() as u32,
                 (frame as *const DmaBufFrame).cast(),
             ),
+            // The DMA-BUF payload carries its own per-plane acquire fences
+            // (a snapshot's copy completion), which consumers of that resource
+            // already wait for; the envelope adds no separate synchronization.
             acquire_sync: none(),
             context: lease.context,
             retain,

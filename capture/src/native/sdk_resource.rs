@@ -1,6 +1,33 @@
 //! Public capture ABI supplied by the selected SDK.
 #![allow(unused_imports)]
 pub use amaterasu_media::*;
+use amaterasu_module_sdk::abi::Status;
+use std::ffi::c_void;
+
+// Capture v1.12 bridge. The pinned SDK revision predates the frame timing
+// tail; these definitions mirror the host SDK's `amaterasu_media.h` and are
+// checked field by field against it below whenever that header is present.
+// Remove them once the provider pins an SDK revision that publishes v1.12.
+
+/// Capture API v1.12 adds `frame_timing`.
+pub const CAPTURE_FRAME_TIMING_INTERFACE_MINOR: u32 = 12;
+
+/// Host timing of one presentation, keyed by its stream sequence. The start is
+/// the host monotonic clock (CLOCK_MONOTONIC) in microseconds; zero is unknown.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureFrameTimingV1 {
+    pub sequence: u64,
+    pub processing_started_host_us: u64,
+}
+
+/// Additive v1.12 tail preserving the complete v1.11 prefix.
+#[repr(C)]
+pub struct CaptureApiV1_12 {
+    pub base: CaptureApiV1_11,
+    pub frame_timing:
+        unsafe extern "C" fn(*mut c_void, u64, u64, *mut CaptureFrameTimingV1) -> Status,
+}
 
 #[cfg(all(test, target_pointer_width = "64"))]
 mod tests {
@@ -19,6 +46,11 @@ mod tests {
             112
         );
         assert_eq!(std::mem::size_of::<CaptureApiV1_8>(), 136);
+        assert_eq!(std::mem::size_of::<CaptureFrameTimingV1>(), 16);
+        assert_eq!(
+            std::mem::offset_of!(CaptureApiV1_12, frame_timing),
+            std::mem::size_of::<CaptureApiV1_11>()
+        );
     }
 
     #[test]
@@ -178,6 +210,18 @@ mod tests {
             "AmaterasuCaptureApiV1_10",
             base,
             color_provenance
+        );
+        fields!(
+            CaptureFrameTimingV1,
+            "AmaterasuCaptureFrameTimingV1",
+            sequence,
+            processing_started_host_us
+        );
+        fields!(
+            CaptureApiV1_12,
+            "AmaterasuCaptureApiV1_12",
+            base,
+            frame_timing
         );
 
         let mut source = String::from(

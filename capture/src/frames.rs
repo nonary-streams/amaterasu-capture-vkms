@@ -6,7 +6,7 @@
 //! without asking the helper. Ordinary exports retain the scanout allocation;
 //! driver leases hold producer storage directly; optional GPU snapshots decouple
 //! capture from producer pacing. A consumed driver lease is never cached.
-use crate::admission::Admission;
+use crate::{admission::Admission, snapshot::PooledSnapshot, snapshot::SlotClaim};
 use amaterasu_media::{
     CAPTURE_FRAME_CACHED_REUSE, CAPTURE_FRAME_FRESH, DMABUF_COLOR_SRGB, DMABUF_MAX_DIMENSION,
     DmaBufFrame, DmaBufPlane, MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING,
@@ -15,6 +15,7 @@ use amaterasu_media::{
 use amaterasu_module_sdk::abi::{STATUS_OK, Status};
 use amaterasu_vkms_frame_helper::client::ExportedFrame;
 use std::{
+    collections::VecDeque,
     os::fd::AsRawFd,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError, TryLockError,
@@ -25,6 +26,18 @@ use std::{
 
 /// Maximum time an unclaimed direct frame may hold up producer retirement.
 const DIRECT_MAILBOX_LIFETIME: Duration = Duration::from_millis(25);
+/// Stored presentations whose processing start remains queryable. Consumers
+/// ask right after submitting a frame, so a short history suffices.
+const PROCESSING_START_HISTORY: usize = 32;
+
+/// A presentation the presentation thread is storing: its stream sequence and
+/// the host monotonic time (`amaterasu_media::host_monotonic_micros`) at which
+/// the thread began handling it, before export or copy. Zero means unknown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Presented {
+    pub sequence: u64,
+    pub processing_started_host_us: u64,
+}
 
 /// Why a stream stopped delivering; reported in status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,9 +78,22 @@ impl StreamFault {
 pub struct StoredFrame {
     frame: DmaBufFrame,
     _descriptors: ExportedFrame,
+    /// Private pool storage is reusable only after this frame and every
+    /// lease of it drop. Declared after the descriptors so they close first.
+    _slot: Option<Arc<SlotClaim>>,
     immutable: bool,
     producer_held: bool,
     hdr_metadata: [u16; 12],
+}
+
+impl Presented {
+    #[cfg(test)]
+    pub fn unknown_start(sequence: u64) -> Self {
+        Self {
+            sequence,
+            processing_started_host_us: 0,
+        }
+    }
 }
 
 impl StoredFrame {
@@ -90,6 +116,8 @@ struct Newest {
     /// newest presentation cannot be described.
     frame: Result<Arc<StoredFrame>, Status>,
     direct_deadline: Option<Instant>,
+    /// (stream sequence, processing start) of recently stored presentations.
+    processing_starts: VecDeque<(u64, u64)>,
 }
 
 pub struct StreamFrames {
@@ -137,6 +165,7 @@ impl StreamFrames {
                 presentation: PresentationStatus::default(),
                 frame: Err(MEDIA_PENDING),
                 direct_deadline: None,
+                processing_starts: VecDeque::with_capacity(PROCESSING_START_HISTORY),
             }),
             reading: Mutex::new(()),
             crtc_id: AtomicU32::new(crtc_id),
@@ -222,35 +251,68 @@ impl StreamFrames {
         Ok(self.lock_newest().presentation)
     }
 
-    /// Stores `exported` as the newest frame under the stream `sequence`.
-    /// The previous frame's descriptors close at once unless a read still
-    /// borrows them, in which case they close when that read ends.
-    pub fn store(&self, exported: ExportedFrame, sequence: u64) {
-        self.store_frame(exported, sequence, false, false, None);
+    /// Stores `exported` as the newest frame. The previous frame's
+    /// descriptors close at once unless a read still borrows them, in which
+    /// case they close when that read ends.
+    pub fn store_presented(&self, exported: ExportedFrame, presented: Presented) {
+        self.store_frame(exported, None, presented, false, false, None);
     }
 
-    /// A completed private copy may remain cached independently of the producer.
-    pub fn store_snapshot(&self, exported: ExportedFrame, sequence: u64) {
-        self.store_frame(exported, sequence, true, false, None);
+    /// A private copy may remain cached independently of the producer. Its
+    /// pool buffer stays claimed until the last reference to it drops; readers
+    /// wait for the copy through the frame's acquire fence.
+    pub fn store_presented_snapshot(&self, snapshot: PooledSnapshot, presented: Presented) {
+        self.store_frame(
+            snapshot.frame,
+            Some(snapshot.slot),
+            presented,
+            true,
+            false,
+            None,
+        );
     }
 
     /// The source remains immutable through its driver lease. Do not cache its
     /// initial reference after successful delivery, or producer progress stalls.
+    pub fn store_presented_leased(
+        &self,
+        exported: ExportedFrame,
+        presented: Presented,
+        crtc_id: u32,
+    ) {
+        self.store_frame(exported, None, presented, true, true, Some(crtc_id));
+    }
+
+    #[cfg(test)]
+    pub fn store(&self, exported: ExportedFrame, sequence: u64) {
+        self.store_presented(exported, Presented::unknown_start(sequence));
+    }
+
+    #[cfg(test)]
+    pub fn store_snapshot(&self, exported: ExportedFrame, sequence: u64) {
+        let presented = Presented::unknown_start(sequence);
+        self.store_frame(exported, None, presented, true, false, None);
+    }
+
+    #[cfg(test)]
     pub fn store_leased(&self, exported: ExportedFrame, sequence: u64, crtc_id: u32) {
-        self.store_frame(exported, sequence, true, true, Some(crtc_id));
+        self.store_presented_leased(exported, Presented::unknown_start(sequence), crtc_id);
     }
 
     fn store_frame(
         &self,
         exported: ExportedFrame,
-        sequence: u64,
+        slot: Option<Arc<SlotClaim>>,
+        presented: Presented,
         immutable: bool,
         producer_held: bool,
         source_crtc: Option<u32>,
     ) {
+        let sequence = presented.sequence;
         let timestamp_us = self.stream_timestamp_us(exported.descriptor.timestamp_ns);
         let frame = describe(exported, sequence, timestamp_us, immutable).map(|mut stored| {
             stored.producer_held = producer_held;
+            stored._slot = slot;
             Arc::new(stored)
         });
         let replaced = {
@@ -264,12 +326,44 @@ impl StreamFrames {
                 sequence,
                 timestamp_us,
             };
+            if frame.is_ok() {
+                Self::remember_processing_start(&mut newest, presented);
+            }
             std::mem::replace(&mut newest.frame, frame)
         };
         // The old descriptors close outside the lock. Publish only after all
         // frame state is visible; callbacks never acquire pixels inline.
         drop(replaced);
         self.events.ready();
+    }
+
+    fn remember_processing_start(newest: &mut Newest, presented: Presented) {
+        let history = &mut newest.processing_starts;
+        if history.len() == PROCESSING_START_HISTORY {
+            history.pop_front();
+        }
+        history.push_back((presented.sequence, presented.processing_started_host_us));
+    }
+
+    /// When the presentation thread began handling the stored presentation
+    /// with stream `sequence`, on the host monotonic clock. `MEDIA_PENDING`
+    /// means no record: not stored (yet), or evicted from the bounded history.
+    pub fn processing_started_host_us(&self, sequence: u64) -> Result<u64, Status> {
+        if let Some(fault) = self.fault() {
+            return Err(fault.status());
+        }
+        let newest = match self.newest.try_lock() {
+            Ok(newest) => newest,
+            Err(TryLockError::WouldBlock) => return Err(MEDIA_BUSY),
+            Err(TryLockError::Poisoned(_)) => return Err(MEDIA_BACKEND_ERROR),
+        };
+        newest
+            .processing_starts
+            .iter()
+            .rev()
+            .find(|(stored, _)| *stored == sequence)
+            .map(|&(_, started)| started)
+            .ok_or(MEDIA_PENDING)
     }
 
     /// Drop only the mailbox reference; any active or retained read keeps its lease.
@@ -448,6 +542,7 @@ fn describe(
     Ok(StoredFrame {
         frame,
         _descriptors: exported,
+        _slot: None,
         immutable,
         producer_held: false,
         hdr_metadata: descriptor.hdr_metadata,

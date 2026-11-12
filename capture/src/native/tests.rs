@@ -165,7 +165,7 @@ fn the_table_advertises_only_the_configured_frame_lifetime() {
         );
     }
     assert_eq!(
-        TestBinding::bind(&factory, b"amaterasu.video", 11).err(),
+        TestBinding::bind(&factory, b"amaterasu.video", 13).err(),
         Some(MEDIA_UNSUPPORTED)
     );
     assert_eq!(
@@ -173,7 +173,7 @@ fn the_table_advertises_only_the_configured_frame_lifetime() {
             &factory,
             b"amaterasu.video",
             5,
-            size_of::<CaptureApiV1_10>() as u32 + 8
+            size_of::<super::sdk_resource::CaptureApiV1_12>() as u32 + 8
         )
         .err(),
         Some(MEDIA_UNSUPPORTED)
@@ -796,4 +796,52 @@ fn color_provenance_requires_guarded_source_and_completed_frame() {
     assert_eq!(color_provenance_flags(&reader), Err(MEDIA_BACKEND_ERROR));
     frames.admission.close();
     assert_eq!(color_provenance_flags(&reader), Err(MEDIA_CLOSED));
+}
+
+#[test]
+fn frame_timing_reports_stored_presentation_starts_to_the_stream_owner() {
+    use super::sdk_resource::{CaptureApiV1_12, CaptureFrameTimingV1};
+    let (mut factory, script, id) = setup();
+    factory.header = capture_header(true);
+    let binding = TestBinding::bind_sized(
+        &factory,
+        b"amaterasu.video",
+        12,
+        size_of::<CaptureApiV1_12>() as u32,
+    )
+    .unwrap();
+    // SAFETY: the binding advertised and allocated the complete v1.12 table.
+    let api = unsafe { &*binding.0.cast::<CaptureApiV1_12>() };
+    let context = api.base.base.base.base.base.base.context;
+    let frames = factory
+        .controller
+        .lock()
+        .unwrap()
+        .reader("amaterasu.video", id)
+        .unwrap()
+        .frames;
+    let mut timing = CaptureFrameTimingV1::default();
+    // SAFETY: binding and output stay live through each synchronous query.
+    let query = |stream, sequence, timing: *mut CaptureFrameTimingV1| unsafe {
+        (api.frame_timing)(context, stream, sequence, timing)
+    };
+    assert_eq!(query(id, 3, &mut timing), MEDIA_PENDING);
+    frames.store_presented(
+        script.export(3, 0, false),
+        crate::frames::Presented {
+            sequence: 3,
+            processing_started_host_us: 777,
+        },
+    );
+    assert_eq!(query(id, 3, &mut timing), STATUS_OK);
+    assert_eq!(
+        timing,
+        CaptureFrameTimingV1 {
+            sequence: 3,
+            processing_started_host_us: 777
+        }
+    );
+    assert_eq!(query(id, 4, &mut timing), MEDIA_PENDING);
+    assert_eq!(query(id + 1, 3, &mut timing), MEDIA_CLOSED);
+    assert_eq!(query(id, 3, std::ptr::null_mut()), STATUS_INVALID_ARGUMENT);
 }

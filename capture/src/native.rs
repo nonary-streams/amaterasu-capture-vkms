@@ -1,4 +1,5 @@
-//! Native `amaterasu.capture-vkms/1` capture table, v1.8. Only DMA-BUF
+//! Native `amaterasu.capture-vkms/1` capture table, v1.11 with retained
+//! frames (v1.5 otherwise). Only DMA-BUF
 //! delivery is offered; the CPU frame callbacks report MEDIA_UNSUPPORTED.
 //! Reads and presentation queries use the frame the stream's presentation
 //! thread stored and never wait for the helper.
@@ -17,7 +18,8 @@ use amaterasu_module_sdk::abi::{
     STATUS_INTERNAL_ERROR, STATUS_INVALID_ARGUMENT, STATUS_OK, Status,
 };
 use sdk_resource::{
-    CaptureApiV1_7, CaptureApiV1_9, CaptureApiV1_10, CaptureEventSink, HdrMetadata,
+    CAPTURE_FRAME_TIMING_INTERFACE_MINOR, CaptureApiV1_7, CaptureApiV1_9, CaptureApiV1_10,
+    CaptureApiV1_11, CaptureApiV1_12, CaptureEventSink, CaptureFrameTimingV1, HdrMetadata,
 };
 use std::{
     ffi::c_void,
@@ -60,13 +62,13 @@ impl<B: Backend + 'static> Factory<B> {
 fn capture_header(retained: bool) -> AbiHeader {
     AbiHeader {
         size: if retained {
-            size_of::<CaptureApiV1_10>() as u32
+            size_of::<CaptureApiV1_12>() as u32
         } else {
             CAPTURE_API_V1_5_SIZE
         },
         major: INTERFACE_MAJOR,
         minor: if retained {
-            10
+            CAPTURE_FRAME_TIMING_INTERFACE_MINOR
         } else {
             CAPTURE_PRESENTATION_INTERFACE_MINOR
         },
@@ -74,7 +76,7 @@ fn capture_header(retained: bool) -> AbiHeader {
 }
 
 struct Binding<B: Backend> {
-    api: CaptureApiV1_10,
+    api: CaptureApiV1_12,
     resources: Mutex<std::collections::HashMap<u64, resource::OfferState>>,
     subscriptions: Mutex<std::collections::HashMap<u64, Arc<crate::frames::StreamFrames>>>,
     controller: Shared<B>,
@@ -90,33 +92,39 @@ impl<B: Backend> Binding<B> {
         require_lease: bool,
     ) -> Box<Self> {
         let mut binding = Box::new(Self {
-            api: CaptureApiV1_10 {
-                base: CaptureApiV1_9 {
-                    base: CaptureApiV1_7 {
-                        base: CaptureApiV1_6 {
-                            base: NativeInterface {
-                                header,
-                                context: std::ptr::null_mut(),
-                                release: Some(release::<B>),
+            api: CaptureApiV1_12 {
+                base: CaptureApiV1_11 {
+                    base: CaptureApiV1_10 {
+                        base: CaptureApiV1_9 {
+                            base: CaptureApiV1_7 {
+                                base: CaptureApiV1_6 {
+                                    base: NativeInterface {
+                                        header,
+                                        context: std::ptr::null_mut(),
+                                        release: Some(release::<B>),
+                                    },
+                                    read_frame,
+                                    geometry: geometry::<B>,
+                                    read_frame_with_freshness,
+                                    read_frame_with_capture_timestamp,
+                                    read_dmabuf_frame: read_dmabuf_frame::<B>,
+                                    latest_presentation: latest_presentation::<B>,
+                                    read_dmabuf_frame_leased: read_dmabuf_frame_leased::<B>,
+                                },
+                                subscribe_events: subscribe_events::<B>,
+                                unsubscribe_events: unsubscribe_events::<B>,
+                                resolve_swap: unsupported_swap,
                             },
-                            read_frame,
-                            geometry: geometry::<B>,
-                            read_frame_with_freshness,
-                            read_frame_with_capture_timestamp,
-                            read_dmabuf_frame: read_dmabuf_frame::<B>,
-                            latest_presentation: latest_presentation::<B>,
-                            read_dmabuf_frame_leased: read_dmabuf_frame_leased::<B>,
+                            enumerate_resources: resource::enumerate::<B>,
+                            select_resource: resource::select::<B>,
+                            read_resource_frame: resource::read::<B>,
+                            hdr_metadata: hdr_metadata::<B>,
                         },
-                        subscribe_events: subscribe_events::<B>,
-                        unsubscribe_events: unsubscribe_events::<B>,
-                        resolve_swap: unsupported_swap,
+                        color_provenance: color_provenance::<B>,
                     },
-                    enumerate_resources: resource::enumerate::<B>,
-                    select_resource: resource::select::<B>,
-                    read_resource_frame: resource::read::<B>,
-                    hdr_metadata: hdr_metadata::<B>,
+                    source_preflight: unsupported_source_preflight,
                 },
-                color_provenance: color_provenance::<B>,
+                frame_timing: frame_timing::<B>,
             },
             resources: Mutex::new(std::collections::HashMap::new()),
             subscriptions: Mutex::new(std::collections::HashMap::new()),
@@ -124,7 +132,7 @@ impl<B: Backend> Binding<B> {
             caller,
             require_lease,
         });
-        binding.api.base.base.base.base.context = (&mut *binding as *mut Self).cast();
+        binding.api.base.base.base.base.base.base.context = (&mut *binding as *mut Self).cast();
         binding
     }
 
@@ -188,7 +196,7 @@ unsafe extern "C" fn bind<B: Backend + 'static>(
             factory.header,
             factory.require_lease,
         );
-        let interface = &binding.api.base.base.base.base as *const NativeInterface;
+        let interface = &binding.api.base.base.base.base.base.base as *const NativeInterface;
         let _ = Box::into_raw(binding);
         // SAFETY: transfers one stable boxed table, uniquely released by the broker.
         unsafe { output.write(interface) };
@@ -369,6 +377,47 @@ unsafe extern "C" fn latest_presentation<B: Backend>(
     })
 }
 
+/// Reports when the presentation thread began handling one recent stored
+/// presentation, on the host monotonic clock. Never blocks or starts GPU work.
+unsafe extern "C" fn frame_timing<B: Backend>(
+    context: *mut c_void,
+    stream: u64,
+    sequence: u64,
+    output: *mut CaptureFrameTimingV1,
+) -> Status {
+    guarded(|| {
+        if context.is_null()
+            || output.is_null()
+            || !(output as usize).is_multiple_of(align_of::<CaptureFrameTimingV1>())
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: broker retains the native binding until the synchronous call ends.
+        let binding = unsafe { &*context.cast::<Binding<B>>() };
+        let frames = match binding.reader(stream) {
+            Ok(reader) => reader.frames,
+            Err(status) => return status,
+        };
+        let Some(_admission) = frames.admission.enter() else {
+            return MEDIA_CLOSED;
+        };
+        match frames.processing_started_host_us(sequence) {
+            Ok(processing_started_host_us) => {
+                // SAFETY: the validated aligned output slot is writable for
+                // this synchronous native call and holds plain data.
+                unsafe {
+                    output.write(CaptureFrameTimingV1 {
+                        sequence,
+                        processing_started_host_us,
+                    })
+                };
+                STATUS_OK
+            }
+            Err(status) => status,
+        }
+    })
+}
+
 fn guarded(operation: impl FnOnce() -> Status) -> Status {
     catch_unwind(AssertUnwindSafe(operation)).unwrap_or(STATUS_INTERNAL_ERROR)
 }
@@ -512,3 +561,12 @@ fn color_provenance_flags(reader: &crate::controller::Reader) -> Result<u32, Sta
 
 #[cfg(test)]
 mod tests;
+
+// The public SourcePreflightFactory supplies the selected provider's query.
+unsafe extern "C" fn unsupported_source_preflight(
+    _: *mut c_void,
+    _: BorrowedBytes,
+    _: amaterasu_module_sdk::abi::ReplySink,
+) -> Status {
+    MEDIA_UNSUPPORTED
+}

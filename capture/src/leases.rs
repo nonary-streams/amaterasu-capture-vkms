@@ -187,6 +187,44 @@ mod tests {
     }
 
     #[test]
+    fn a_pool_buffer_is_reusable_only_after_the_mailbox_and_every_lease_release_it() {
+        use crate::{
+            frames::Presented,
+            snapshot::{PooledSnapshot, SNAPSHOT_SLOTS, SlotPool},
+        };
+        let _serial = TEST_LEASE_CALLBACKS.lock().unwrap();
+        let mut pool = SlotPool::default();
+        let frames = StreamFrames::new(41, 0);
+        let script = SourceScript::default();
+        // Leave exactly one free buffer so reuse is observable.
+        let others: Vec<_> = (1..SNAPSHOT_SLOTS).map(|_| pool.claim().unwrap()).collect();
+        frames.store_presented_snapshot(
+            PooledSnapshot {
+                frame: script.export(1, 0, false),
+                slot: pool.claim().unwrap(),
+                work: Default::default(),
+            },
+            Presented {
+                sequence: 1,
+                processing_started_host_us: 0,
+            },
+        );
+        assert!(pool.claim().is_none());
+        let lent = frames.lend().unwrap();
+        let lease = lent.lease().unwrap();
+        // SAFETY: the lent frame is live; this test releases the reference below.
+        assert_eq!(unsafe { lease.retain.unwrap()(lease.context) }, STATUS_OK);
+        frames.finish(lent, STATUS_OK);
+        // A newer presentation replaces the mailbox; the consumer still reads.
+        frames.store_snapshot(script.export(2, 0, false), 2);
+        assert!(pool.claim().is_none());
+        // SAFETY: consumes the retained reference after the consumer finished.
+        unsafe { lease.release.unwrap()(lease.context, -1) };
+        assert!(pool.claim().is_some());
+        drop(others);
+    }
+
+    #[test]
     fn retained_reference_bound_spans_distinct_frames_and_streams_then_recovers() {
         let _serial = TEST_LEASE_CALLBACKS.lock().unwrap();
         let frames = [StreamFrames::new(41, 0), StreamFrames::new(42, 0)];

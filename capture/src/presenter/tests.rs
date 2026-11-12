@@ -64,8 +64,8 @@ fn presenter_reports_driver_gaps_through_sdk_logger_without_changing_delivery() 
     );
     presenter.logger = Some(logger);
     presenter.stream_id = 77;
-    presenter.publish(script.export(1, EPOCH_NS, false), 1);
-    presenter.publish(script.export(4, EPOCH_NS + 24_000_000, false), 3);
+    presenter.publish(script.export(1, EPOCH_NS, false), 1, 0);
+    presenter.publish(script.export(4, EPOCH_NS + 24_000_000, false), 3, 0);
     assert_eq!(frames.latest_presentation().unwrap().sequence, 4);
     let started = presenter.diagnostics.started;
     presenter.log_diagnostics(started + Duration::from_secs(10), false);
@@ -417,4 +417,136 @@ fn stopping_the_thread_keeps_the_stored_frame_until_the_stream_drops() {
     assert_eq!(frames.lend().unwrap().frame().sequence, 1);
     drop(frames);
     assert!(script.all_lent_descriptors_closed());
+}
+
+/// Copies by passing the source through, claiming a real pool buffer, or
+/// reports a scripted exhausted pool. Records when each copy began.
+struct ScriptedSnapshotter {
+    exhausted: std::collections::VecDeque<bool>,
+    pool: crate::snapshot::SlotPool,
+    copies_began_at: CopyLog,
+}
+
+impl crate::snapshot::FrameSnapshotter for ScriptedSnapshotter {
+    fn snapshot(
+        &mut self,
+        exported: amaterasu_vkms_frame_helper::client::ExportedFrame,
+    ) -> Result<crate::snapshot::SnapshotOutcome, amaterasu_module_sdk::abi::Status> {
+        use crate::snapshot::{CopyWork, PooledSnapshot, SnapshotOutcome};
+        self.copies_began_at
+            .lock()
+            .unwrap()
+            .push(amaterasu_media::host_monotonic_micros());
+        if self.exhausted.pop_front().unwrap_or(false) {
+            return Ok(SnapshotOutcome::PoolExhausted);
+        }
+        let Some(slot) = self.pool.claim() else {
+            return Ok(SnapshotOutcome::PoolExhausted);
+        };
+        Ok(SnapshotOutcome::Copied(PooledSnapshot {
+            frame: exported,
+            slot,
+            work: CopyWork {
+                source_imported: true,
+                ..CopyWork::default()
+            },
+        }))
+    }
+}
+
+/// Times at which each scripted copy began.
+type CopyLog = Arc<std::sync::Mutex<Vec<u64>>>;
+
+fn scripted_presenter(
+    exhausted: &[bool],
+) -> (Presenter, Arc<StreamFrames>, Arc<SourceScript>, CopyLog) {
+    let script = Arc::new(SourceScript::default());
+    let frames = Arc::new(StreamFrames::new(41, EPOCH_NS));
+    let copies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let presenter = Presenter::new(
+        Box::new(FakeSource::new(script.clone())),
+        frames.clone(),
+        Arc::new(AtomicBool::new(false)),
+        Some(Box::new(ScriptedSnapshotter {
+            exhausted: exhausted.iter().copied().collect(),
+            pool: crate::snapshot::SlotPool::default(),
+            copies_began_at: copies.clone(),
+        })),
+    );
+    (presenter, frames, script, copies)
+}
+
+#[test]
+fn processing_starts_when_the_wait_returns_before_export_and_copy() {
+    let (mut presenter, frames, script, copies) = scripted_presenter(&[]);
+    script.present(1, EPOCH_NS + 16_000_000);
+    let before = amaterasu_media::host_monotonic_micros();
+    assert!(matches!(presenter.step(), Next::Continue));
+    let started = frames.processing_started_host_us(1).unwrap();
+    assert!(started >= before, "{started} {before}");
+    assert!(started <= copies.lock().unwrap()[0]);
+    assert_eq!(frames.processing_started_host_us(2), Err(MEDIA_PENDING));
+    assert_eq!(presenter.diagnostics.source_imports, 1);
+}
+
+#[test]
+fn an_exhausted_pool_skips_the_copy_and_retries_with_the_original_start() {
+    let (mut presenter, frames, script, _) = scripted_presenter(&[true]);
+    presenter.publish(script.export(5, EPOCH_NS + 1_000, false), 5, 1_000);
+    // Nothing was overwritten or published; the presentation waits for a buffer.
+    assert_eq!(frames.latest_presentation().unwrap().sequence, 0);
+    assert_eq!(presenter.diagnostics.pool_exhausted, 1);
+    assert!(presenter.pending_snapshot.is_some());
+    // The retry (a timed-out wait re-exporting the same scanout) keeps the
+    // time processing of this presentation actually began.
+    presenter.publish(script.export(5, EPOCH_NS + 1_000, false), 5, 9_000);
+    assert_eq!(frames.latest_presentation().unwrap().sequence, 5);
+    assert_eq!(frames.processing_started_host_us(5), Ok(1_000));
+    assert_eq!(presenter.diagnostics.snapshot_retries, 1);
+    assert!(presenter.pending_snapshot.is_none());
+}
+
+#[test]
+fn a_newer_presentation_replaces_a_pending_retry_with_its_own_start() {
+    let (mut presenter, frames, script, _) = scripted_presenter(&[true]);
+    presenter.publish(script.export(5, EPOCH_NS + 1_000, false), 5, 1_000);
+    presenter.publish(script.export(6, EPOCH_NS + 2_000, false), 6, 2_000);
+    assert_eq!(frames.latest_presentation().unwrap().sequence, 6);
+    assert_eq!(frames.processing_started_host_us(6), Ok(2_000));
+    assert_eq!(presenter.diagnostics.snapshot_retries, 0);
+}
+
+#[test]
+fn a_skipped_presentation_is_retried_while_the_compositor_is_idle() {
+    let script = Arc::new(SourceScript::default());
+    let frames = Arc::new(StreamFrames::new(41, EPOCH_NS));
+    let copies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let factory_copies = copies.clone();
+    let factory: super::SnapshotterFactory = Box::new(move || {
+        Ok(Box::new(ScriptedSnapshotter {
+            exhausted: [true].into_iter().collect(),
+            pool: crate::snapshot::SlotPool::default(),
+            copies_began_at: factory_copies,
+        }) as Box<dyn crate::snapshot::FrameSnapshotter>)
+    });
+    let _thread = PresentationThread::spawn_with_snapshotter(
+        Box::new(FakeSource::new(script.clone())),
+        frames.clone(),
+        Some(factory),
+        0,
+        None,
+    )
+    .unwrap();
+    script.present(1, EPOCH_NS + 16_000_000);
+    // No further presentation: the retry re-exports the newest scanout.
+    script.push(Scripted::Frame {
+        sequence: 1,
+        timestamp_ns: EPOCH_NS + 16_000_000,
+    });
+    assert!(eventually(|| frames.processing_started_host_us(1).is_ok()));
+    let copies = copies.lock().unwrap();
+    assert_eq!(copies.len(), 2);
+    // The stored start is the original wait return, before the skipped copy.
+    let started = frames.processing_started_host_us(1).unwrap();
+    assert!(started > 0 && started <= copies[0], "{started} {copies:?}");
 }
