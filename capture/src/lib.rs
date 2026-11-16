@@ -18,6 +18,7 @@ mod events;
 mod frames;
 mod geometry;
 mod leases;
+mod lifecycle_issues;
 mod model;
 mod native;
 mod output_name;
@@ -32,7 +33,8 @@ use amaterasu_module_sdk::capture::{
     SourcePreflightResponse,
 };
 use amaterasu_module_sdk::{
-    Command, LogQueue, ManagedModule, ModuleResult, Response, RuntimeClient,
+    Command, LogLevel, LogQueue, ManagedModule, ModuleResult, Response, RuntimeClient,
+    stream_lifecycle::StreamIssueOutbox,
 };
 use backend::NativeBackend;
 use controller::Controller;
@@ -80,6 +82,10 @@ struct CaptureModule {
     epoch: Instant,
     pending_closes: Vec<PendingClose>,
     pending_opens: pending_open::PendingOpens,
+    stream_issues: StreamIssueOutbox,
+    /// Off unless started by the runtime, so scripted fixtures see only the
+    /// commands they expect.
+    report_stream_issues: bool,
 }
 
 struct PendingClose {
@@ -130,11 +136,14 @@ impl ManagedModule for CaptureModule {
             epoch: Instant::now(),
             pending_closes: Vec::new(),
             pending_opens: pending_open::PendingOpens::default(),
+            stream_issues: StreamIssueOutbox::default(),
+            report_stream_issues: true,
         })
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
         self.log_queue.flush(&self.runtime);
+        self.publish_stream_issues();
         self.poll_pending_closes()?;
         let now = self.epoch.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         {
@@ -228,6 +237,29 @@ impl ManagedModule for CaptureModule {
 }
 
 impl CaptureModule {
+    /// Publish what opens and the data path reported. A native read or
+    /// preflight holding the controller defers this to a later tick rather
+    /// than waiting.
+    fn publish_stream_issues(&mut self) {
+        if let Ok(mut controller) = self.controller.try_lock() {
+            controller.take_stream_issues(&mut self.stream_issues);
+        }
+        if !self.report_stream_issues {
+            self.stream_issues.drain().for_each(drop);
+            return;
+        }
+        if self.stream_issues.is_empty() {
+            return;
+        }
+        if let Err(error) = self.stream_issues.flush(&self.runtime) {
+            let _ = self.runtime.log(
+                LogLevel::Warning,
+                "capture.stream_issues",
+                &format!("stream issue report failed error={error}"),
+            );
+        }
+    }
+
     fn try_controller(
         shared: &native::Shared<NativeBackend>,
     ) -> ModuleResult<Option<std::sync::MutexGuard<'_, Controller<NativeBackend>>>> {

@@ -93,6 +93,13 @@ impl PendingOpens {
 }
 
 impl PendingOpen {
+    fn operation_id(&self) -> Option<&str> {
+        match &self.operation {
+            Operation::Open { operation_id, .. } => operation_id.as_deref(),
+            _ => None,
+        }
+    }
+
     fn progress<B: Backend>(
         &mut self,
         runtime: &RuntimeClient,
@@ -129,6 +136,7 @@ impl PendingOpen {
                     error.message
                 );
             }
+            controller.report_open_failure(self.operation_id(), &error);
             return Progress::Finished(complete_reply(
                 runtime,
                 controller,

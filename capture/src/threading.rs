@@ -5,15 +5,31 @@ mod linux;
 
 /// Vibeshine's critical streaming level. Installations without CAP_SYS_NICE
 /// receive the strongest level their RLIMIT_NICE permits.
-const CRITICAL_NICE: i32 = -15;
+pub(crate) const CRITICAL_NICE: i32 = -15;
 
-pub fn configure_capture_thread() {
+/// The priority a capture thread obtained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapturePriority {
+    Critical,
+    /// RLIMIT_NICE allowed only this weaker level.
+    Limited {
+        nice: i32,
+    },
+    /// The thread kept the priority it inherited.
+    Unchanged,
+}
+
+pub fn configure_capture_thread() -> CapturePriority {
     match linux::raise_toward(CRITICAL_NICE) {
         Ok(applied) if applied != CRITICAL_NICE => {
             eprintln!("VKMS capture thread priority limited to nice {applied} by RLIMIT_NICE");
+            CapturePriority::Limited { nice: applied }
         }
-        Ok(_) => {}
-        Err(error) => eprintln!("VKMS capture thread critical priority unavailable: {error}"),
+        Ok(_) => CapturePriority::Critical,
+        Err(error) => {
+            eprintln!("VKMS capture thread critical priority unavailable: {error}");
+            CapturePriority::Unchanged
+        }
     }
 }
 

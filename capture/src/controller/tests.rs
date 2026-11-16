@@ -576,3 +576,156 @@ fn shutdown_closes_admission_for_every_stream() {
         "capture_disabled"
     );
 }
+
+const STREAM_REPORTS: &str = "amaterasu.stream.report/1";
+
+/// Reports the controller would publish now. A capture thread's priority
+/// depends on the test host's limits, so those demotions are left out.
+fn published(controller: &mut Controller<FakeBackend>) -> Vec<serde_json::Value> {
+    let mut outbox = StreamIssueOutbox::default();
+    controller.take_stream_issues(&mut outbox);
+    let mut reports = Vec::new();
+    outbox
+        .flush_with(&mut |command| {
+            if let crate::Command::Publish { topic, payload } = command
+                && topic == STREAM_REPORTS
+            {
+                reports.push(payload);
+            }
+            Ok(crate::Response::Ok)
+        })
+        .unwrap();
+    reports.retain(|report| report["phase"] != "vkms.thread_priority");
+    reports
+}
+
+fn site(report: &serde_json::Value) -> &str {
+    report["site"].as_str().unwrap()
+}
+
+#[test]
+fn a_failed_data_path_is_reported_once_under_the_opening_operation() {
+    let (mut controller, backend) = controller();
+    let id = opened(&mut controller);
+    let frames = controller.reader(VIDEO, id).unwrap().frames;
+    backend.script.push_wait(ScriptedWait::HelperGone);
+    assert!(eventually(|| frames.fault().is_some()));
+    // Later failures of the same stream are the consumer's to see, not the
+    // stream record's.
+    frames.report_read_failure("lease_unavailable");
+    frames.set_fault(StreamFault::OutputLost("output_disconnected"));
+    // The report queued on the data path outlives the stream's close.
+    close(&mut controller, id);
+
+    let reports = published(&mut controller);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    let report = &reports[0];
+    assert_eq!(report["kind"], "issue");
+    assert_eq!(report["operation"], "video-1");
+    assert_eq!(report["layer"], "capture");
+    assert_eq!(report["phase"], "vkms.export");
+    assert_eq!(report["code"], "frame_helper_failed");
+    assert_eq!(report["disposition"], "critical_failure");
+    assert!(report.get("caused_by").is_none());
+    assert!(site(report).contains("presenter.rs:"), "{report}");
+    assert!(published(&mut controller).is_empty());
+}
+
+#[test]
+fn a_failed_native_read_names_its_call_site() {
+    let (mut controller, _backend) = controller();
+    let id = opened(&mut controller);
+    let frames = controller.reader(VIDEO, id).unwrap().frames;
+    frames.report_read_failure("lease_unavailable");
+    let reports = published(&mut controller);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0]["phase"], "vkms.read");
+    assert_eq!(reports[0]["code"], "lease_unavailable");
+    assert!(site(&reports[0]).contains("tests.rs:"), "{}", reports[0]);
+    close(&mut controller, id);
+}
+
+#[test]
+fn a_disconnected_output_is_reported_as_caused_by_the_display() {
+    let (mut controller, backend) = controller();
+    let id = opened(&mut controller);
+    let mut gone = connector(9, 41, 1920);
+    gone.connection = crate::discovery::Connection::Disconnected;
+    *backend.connectors.lock().unwrap() = Ok(vec![gone]);
+    controller.refresh(RESOLVE_INTERVAL_MS);
+
+    let reports = published(&mut controller);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0]["operation"], "video-1");
+    assert_eq!(reports[0]["phase"], "vkms.resolve");
+    assert_eq!(reports[0]["code"], "capture_output_lost");
+    assert_eq!(reports[0]["caused_by"], "display");
+    assert_eq!(reports[0]["reason"], "output_disconnected");
+    assert!(
+        site(&reports[0]).contains("controller.rs:"),
+        "{}",
+        reports[0]
+    );
+    close(&mut controller, id);
+}
+
+#[test]
+fn a_refused_open_is_reported_under_its_operation() {
+    let (mut controller, _backend) = controller();
+    let refused = controller.handle("unauthorized", open("kwin:Virtual-9", "video-2"), 0);
+    assert_eq!(refused.err().unwrap().code, "capture_permission_denied");
+    // Without a valid operation there is no stream to report to.
+    let _ = controller.handle(
+        VIDEO,
+        Operation::Open {
+            output: "kwin:Virtual-9".into(),
+            operation_id: None,
+            constant_rate: None,
+        },
+        0,
+    );
+
+    let reports = published(&mut controller);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0]["kind"], "issue");
+    assert_eq!(reports[0]["operation"], "video-2");
+    assert_eq!(reports[0]["layer"], "capture");
+    assert_eq!(reports[0]["phase"], "vkms.open");
+    assert_eq!(reports[0]["code"], "capture_permission_denied");
+    assert!(
+        site(&reports[0]).contains("controller.rs:"),
+        "{}",
+        reports[0]
+    );
+}
+
+#[test]
+fn a_missing_output_at_open_is_caused_by_the_display() {
+    let (mut controller, backend) = controller();
+    *backend.connectors.lock().unwrap() = Ok(Vec::new());
+    let refused = controller.handle(VIDEO, open("kwin:Virtual-9", "video-3"), 0);
+    let code = refused.err().unwrap().code;
+    let reports = published(&mut controller);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0]["phase"], "vkms.open");
+    assert_eq!(reports[0]["code"], "capture_output_lost");
+    assert_eq!(reports[0]["caused_by"], "display");
+    assert_eq!(reports[0]["reason"], code);
+}
+
+#[test]
+fn a_limited_capture_priority_is_a_demoted_fallback() {
+    use crate::threading::CapturePriority;
+    let frames = StreamFrames::for_operation(41, 0, "video-4".into());
+    frames.report_priority(CapturePriority::Critical);
+    frames.report_priority(CapturePriority::Limited { nice: -5 });
+    let mut outbox = StreamIssueOutbox::default();
+    frames.drain_issues(&mut outbox);
+    let reports: Vec<_> = outbox.drain().collect();
+    assert_eq!(reports.len(), 1);
+    let report = serde_json::to_value(&reports[0]).unwrap();
+    assert_eq!(report["disposition"], "demoted_warning");
+    assert_eq!(report["code"], "capture_priority_limited");
+    assert_eq!(report["fallback"], "rlimit_nice");
+    assert!(site(&report).contains("tests.rs:"), "{report}");
+}

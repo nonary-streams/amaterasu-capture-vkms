@@ -40,3 +40,9 @@ cc = "1"
 unsafe_op_in_unsafe_fn = "deny"
 
 [workspace]
+
+# Built inside the Amaterasu tree, the capture provider uses that tree's SDK,
+# so its stream reports match the host it is installed with.
+[patch."https://github.com/nonary-streams/amaterasu-sdk"]
+amaterasu-module-sdk = { path = "../../../crates/module-sdk" }
+amaterasu-media = { path = "../../../crates/media" }

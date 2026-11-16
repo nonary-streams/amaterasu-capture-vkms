@@ -6,13 +6,19 @@
 //! without asking the helper. Ordinary exports retain the scanout allocation;
 //! driver leases hold producer storage directly; optional GPU snapshots decouple
 //! capture from producer pacing. A consumed driver lease is never cached.
-use crate::{admission::Admission, snapshot::PooledSnapshot, snapshot::SlotClaim};
+use crate::{
+    admission::Admission, lifecycle_issues, snapshot::PooledSnapshot, snapshot::SlotClaim,
+    threading::CapturePriority,
+};
 use amaterasu_media::{
     CAPTURE_FRAME_CACHED_REUSE, CAPTURE_FRAME_FRESH, DMABUF_COLOR_SRGB, DMABUF_MAX_DIMENSION,
     DmaBufFrame, DmaBufPlane, MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING,
     MEDIA_UNSUPPORTED, PresentationStatus,
 };
-use amaterasu_module_sdk::abi::{STATUS_OK, Status};
+use amaterasu_module_sdk::{
+    abi::{STATUS_OK, Status},
+    stream_lifecycle::{StreamIssue, StreamIssueOutbox},
+};
 use amaterasu_vkms_frame_helper::client::ExportedFrame;
 use std::{
     collections::VecDeque,
@@ -136,6 +142,14 @@ pub struct StreamFrames {
     resolve_requested: AtomicBool,
     capture_requested: AtomicBool,
     fault: Mutex<Option<StreamFault>>,
+    /// The video service's operation for this stream; issues are reported
+    /// under it. Streams without one report nothing.
+    operation: Option<String>,
+    /// Only the first data-path failure of a stream is reported.
+    failure_reported: AtomicBool,
+    /// Issues the data path queued for the controller's next tick. Pushing
+    /// and taking hold this lock briefly; nothing here publishes.
+    issues: Mutex<StreamIssueOutbox>,
 }
 
 /// One stored frame lent to a sink. The read gate stays held and the
@@ -176,6 +190,18 @@ impl StreamFrames {
             resolve_requested: AtomicBool::new(false),
             capture_requested: AtomicBool::new(false),
             fault: Mutex::new(None),
+            operation: None,
+            failure_reported: AtomicBool::new(false),
+            issues: Mutex::new(StreamIssueOutbox::default()),
+        }
+    }
+
+    /// A stream whose failures are reported under the video service's
+    /// `operation`.
+    pub fn for_operation(crtc_id: u32, epoch_ns: u64, operation: String) -> Self {
+        Self {
+            operation: Some(operation),
+            ..Self::new(crtc_id, epoch_ns)
         }
     }
 
@@ -235,12 +261,70 @@ impl StreamFrames {
         *self.fault.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records why delivery stopped. The first fault is kept.
+    /// Records why delivery stopped. The first fault is kept, and reported
+    /// unless an earlier data-path failure of the stream already was.
+    #[track_caller]
     pub fn set_fault(&self, fault: StreamFault) {
         let mut current = self.fault.lock().unwrap_or_else(PoisonError::into_inner);
+        let first = current.is_none();
         let reason = current.get_or_insert(fault).code();
         drop(current);
+        if first && let Some(operation) = self.claim_failure_report() {
+            self.queue_issue(lifecycle_issues::stream_fault(operation, fault));
+        }
         self.events.close(reason);
+    }
+
+    /// Reports a failed native read unless the stream already reported a
+    /// data-path failure. The caller still returns its own status.
+    #[track_caller]
+    pub fn report_read_failure(&self, code: &str) {
+        if let Some(operation) = self.claim_failure_report() {
+            self.queue_issue(lifecycle_issues::capture_failure(
+                operation,
+                "vkms.read",
+                code,
+            ));
+        }
+    }
+
+    /// Reports the capture thread falling short of critical priority.
+    #[track_caller]
+    pub fn report_priority(&self, priority: CapturePriority) {
+        if let Some(operation) = &self.operation
+            && let Some(issue) = lifecycle_issues::priority_fallback(operation, priority)
+        {
+            self.queue_issue(issue);
+        }
+    }
+
+    /// Moves queued issues to the controller. A data path pushing at this
+    /// moment keeps them for the next take.
+    pub fn take_issues(&self, to: &mut StreamIssueOutbox) {
+        if let Ok(mut issues) = self.issues.try_lock() {
+            lifecycle_issues::transfer(&mut issues, to);
+        }
+    }
+
+    /// Moves every queued issue to the controller, waiting for a concurrent
+    /// push. Used once the presentation thread has joined.
+    pub fn drain_issues(&self, to: &mut StreamIssueOutbox) {
+        let mut issues = self.issues.lock().unwrap_or_else(PoisonError::into_inner);
+        lifecycle_issues::transfer(&mut issues, to);
+    }
+
+    /// The operation to report the stream's first data-path failure under,
+    /// once per stream.
+    fn claim_failure_report(&self) -> Option<&str> {
+        let operation = self.operation.as_deref()?;
+        (!self.failure_reported.swap(true, Ordering::SeqCst)).then_some(operation)
+    }
+
+    fn queue_issue(&self, issue: StreamIssue) {
+        self.issues
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(issue);
     }
 
     /// The newest stored presentation; sequence zero before the first.
@@ -315,6 +399,16 @@ impl StreamFrames {
             stored._slot = slot;
             Arc::new(stored)
         });
+        if frame.is_err()
+            && let Some(operation) = self.claim_failure_report()
+        {
+            // Reads return MEDIA_UNSUPPORTED until a describable frame arrives.
+            self.queue_issue(lifecycle_issues::capture_failure(
+                operation,
+                "vkms.export",
+                "dmabuf_unsupported",
+            ));
+        }
         let replaced = {
             let mut newest = self.lock_newest();
             if source_crtc.is_some_and(|id| self.crtc_id() != id) {

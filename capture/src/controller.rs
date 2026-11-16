@@ -8,6 +8,7 @@ use crate::{
     discovery::OutputBinding,
     frames::{StreamFault, StreamFrames},
     geometry::{self, LayoutOutput},
+    lifecycle_issues,
     model::{
         CaptureError, CaptureResult, MAX_ENUMERATION_LIMIT, MAX_LIFETIME_STREAMS, MAX_STREAMS,
         Operation, Settings, new_id, validate_operation_id,
@@ -16,7 +17,7 @@ use crate::{
     presenter::PresentationThread,
 };
 use amaterasu_media::CaptureGeometry;
-use amaterasu_module_sdk::LogEmitter;
+use amaterasu_module_sdk::{LogEmitter, stream_lifecycle::StreamIssueOutbox};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -112,6 +113,8 @@ pub struct Controller<B: Backend> {
     opened: u64,
     last_availability: Option<Availability>,
     retiring_admissions: Vec<Arc<Admission>>,
+    /// Refused opens and the queues of finished streams, for the tick.
+    issues: StreamIssueOutbox,
     // Rust drops fields in declaration order. Source workers must stop before
     // the backend's last owned legacy-reaper receipts perform final containment.
     backend: B,
@@ -136,6 +139,7 @@ impl<B: Backend> Controller<B> {
             opened: 0,
             last_availability: None,
             retiring_admissions: Vec::new(),
+            issues: StreamIssueOutbox::default(),
         }
     }
 
@@ -153,13 +157,24 @@ impl<B: Backend> Controller<B> {
                 output,
                 operation_id,
                 constant_rate,
-            } => self.open(
-                caller,
-                &output,
-                operation_id,
-                constant_rate.unwrap_or(false),
-                now,
-            ),
+            } => {
+                let reporting = operation_id.clone();
+                let result = self.open(
+                    caller,
+                    &output,
+                    operation_id,
+                    constant_rate.unwrap_or(false),
+                    now,
+                );
+                // The pending open retries an unsettled layout and reports
+                // the refusal it finally replies with.
+                if let Err(error) = &result
+                    && error.code != "output_geometry_unavailable"
+                {
+                    self.report_open_failure(reporting.as_deref(), error);
+                }
+                result
+            }
             Operation::Lookup { operation_id } => {
                 validate_operation_id(&operation_id)?;
                 self.find_operation(caller, &operation_id)
@@ -172,6 +187,27 @@ impl<B: Backend> Controller<B> {
                 }
                 Ok(Reply::existing(json!({"ok":true})))
             }
+        }
+    }
+
+    /// A refused open the video service still waits for. An open without a
+    /// valid operation has nothing to report under.
+    pub(crate) fn report_open_failure(&mut self, operation: Option<&str>, error: &CaptureError) {
+        let Some(operation) = operation.filter(|id| validate_operation_id(id).is_ok()) else {
+            return;
+        };
+        self.issues.push(lifecycle_issues::capture_failure(
+            operation,
+            "vkms.open",
+            error.code,
+        ));
+    }
+
+    /// Move queued stream issues to the module's tick for publication.
+    pub fn take_stream_issues(&mut self, outbox: &mut StreamIssueOutbox) {
+        lifecycle_issues::transfer(&mut self.issues, outbox);
+        for stream in self.streams.values() {
+            stream.frames.take_issues(outbox);
         }
     }
 
@@ -228,9 +264,10 @@ impl<B: Backend> Controller<B> {
         let authoritative_color = cfg!(feature = "driver-read-leases")
             && self.settings.require_lease
             && source.holds_producer();
-        let frames = Arc::new(StreamFrames::new(
+        let frames = Arc::new(StreamFrames::for_operation(
             binding.crtc_id,
             self.backend.monotonic_now_ns(),
+            operation.clone(),
         ));
         let presenter = PresentationThread::spawn_with_snapshot(
             source,
@@ -338,6 +375,7 @@ impl<B: Backend> Controller<B> {
     /// retained leases keep their exact storage; metadata retains no mailbox FD.
     fn finish_stream(&mut self, id: u64) {
         if let Some(stream) = self.streams.remove(&id) {
+            stream.frames.drain_issues(&mut self.issues);
             stream.frames.close();
             self.retiring_admissions
                 .retain(|admission| !admission.is_idle());

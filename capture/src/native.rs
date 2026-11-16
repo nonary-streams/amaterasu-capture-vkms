@@ -335,7 +335,10 @@ unsafe extern "C" fn read_dmabuf_frame_leased<B: Backend>(
         };
         let lease = match lent.lease() {
             Ok(lease) => lease,
-            Err(status) => return status,
+            Err(status) => {
+                frames.report_read_failure("lease_unavailable");
+                return status;
+            }
         };
         // SAFETY: the lent Arc pins immutable private storage through callback.
         // A consumer retaining it must keep this native binding live until release.

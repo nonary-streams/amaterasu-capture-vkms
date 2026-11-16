@@ -27,6 +27,7 @@ struct HostFixture {
     polls: Mutex<std::collections::VecDeque<crate::Response>>,
     ended: Mutex<std::collections::BTreeSet<u64>>,
     fail_next_completion: std::sync::atomic::AtomicBool,
+    published: Mutex<Vec<(String, serde_json::Value)>>,
 }
 
 impl HostFixture {
@@ -57,6 +58,10 @@ impl HostFixture {
                     }
                 }
                 crate::Command::CheckRequest { .. } => crate::Response::Ok,
+                crate::Command::Publish { topic, payload } => {
+                    host.published.lock().unwrap().push((topic, payload));
+                    crate::Response::Ok
+                }
                 crate::Command::Complete { request, payload } => {
                     if host.fail_next_completion.swap(false, Ordering::SeqCst) {
                         return STATUS_INTERNAL_ERROR;
@@ -242,6 +247,7 @@ fn module(controller: Controller<FakeBackend>) -> crate::CaptureModule {
         opened: controller.opened,
         last_availability: controller.last_availability,
         retiring_admissions: controller.retiring_admissions,
+        issues: controller.issues,
     }));
     let factory = crate::native::Factory::new(controller.clone());
     // SAFETY: both stable boxed factories and the shared metadata controller
@@ -271,6 +277,8 @@ fn module(controller: Controller<FakeBackend>) -> crate::CaptureModule {
         epoch: Instant::now(),
         pending_closes: Vec::new(),
         pending_opens: crate::pending_open::PendingOpens::default(),
+        stream_issues: Default::default(),
+        report_stream_issues: false,
     }
 }
 
@@ -864,4 +872,125 @@ fn a_failed_privileged_receipt_remains_a_cleanup_error() {
             .contains_key(&stream)
     );
     drop(module);
+}
+
+const STREAM_REPORTS: &str = "amaterasu.stream.report/1";
+
+fn stream_reports(host: &HostFixture) -> Vec<serde_json::Value> {
+    host.published
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(topic, report)| {
+            topic == STREAM_REPORTS && report["phase"] != "vkms.thread_priority"
+        })
+        .map(|(_, report)| report.clone())
+        .collect()
+}
+
+#[test]
+fn the_tick_publishes_a_refused_open_once() {
+    let host = Arc::new(HostFixture::default());
+    let mut controller = Controller::new(FakeBackend::new(), settings());
+    assert!(
+        controller
+            .handle("unauthorized", pending_open("video-5-capture"), 0)
+            .is_err()
+    );
+    let mut module = module(controller);
+    module.runtime = host.runtime();
+    module.report_stream_issues = true;
+    module.tick().unwrap();
+    module.tick().unwrap();
+
+    let reports = stream_reports(&host);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0]["kind"], "issue");
+    assert_eq!(reports[0]["operation"], "video-5-capture");
+    assert_eq!(reports[0]["layer"], "capture");
+    assert_eq!(reports[0]["phase"], "vkms.open");
+    assert_eq!(reports[0]["code"], "capture_permission_denied");
+    assert!(
+        reports[0]["site"]
+            .as_str()
+            .unwrap()
+            .contains("controller.rs:"),
+        "{}",
+        reports[0]
+    );
+    assert!(module.stream_issues.is_empty());
+}
+
+#[test]
+fn a_module_with_reports_off_discards_queued_issues_without_publishing() {
+    let host = Arc::new(HostFixture::default());
+    let mut controller = Controller::new(FakeBackend::new(), settings());
+    assert!(
+        controller
+            .handle("unauthorized", pending_open("video-6-capture"), 0)
+            .is_err()
+    );
+    let mut module = module(controller);
+    module.runtime = host.runtime();
+    module.tick().unwrap();
+    assert!(host.published.lock().unwrap().is_empty());
+    assert!(module.stream_issues.is_empty());
+    let mut remaining = amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox::default();
+    module
+        .lock_controller()
+        .unwrap()
+        .take_stream_issues(&mut remaining);
+    assert!(remaining.is_empty());
+}
+
+#[test]
+fn a_geometry_wait_reports_only_its_final_refusal() {
+    let host = Arc::new(HostFixture::default());
+    let backend = FakeBackend::new();
+    let handles = backend.handles();
+    *handles.layout.lock().unwrap() = Some(crate::test_support::appended_layout(2560));
+    let mut controller = Controller::new(backend, settings());
+    let mut opens = crate::pending_open::PendingOpens::default();
+    assert!(opens.enqueue(26, VIDEO, pending_open("video-7-capture"), 0));
+    for now in [0, 50, 100] {
+        opens
+            .poll(&host.runtime(), &mut controller, now, false)
+            .unwrap();
+    }
+    let mut outbox = amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox::default();
+    controller.take_stream_issues(&mut outbox);
+    assert!(outbox.is_empty(), "retries are not refusals");
+    opens
+        .poll(&host.runtime(), &mut controller, 4_000, false)
+        .unwrap();
+    controller.take_stream_issues(&mut outbox);
+    let reports: Vec<_> = outbox
+        .drain()
+        .map(|report| serde_json::to_value(report).unwrap())
+        .collect();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0]["operation"], "video-7-capture");
+    assert_eq!(reports[0]["code"], "output_geometry_unavailable");
+}
+
+#[test]
+fn a_cancelled_geometry_wait_reports_nothing() {
+    let host = Arc::new(HostFixture::default());
+    let backend = FakeBackend::new();
+    let handles = backend.handles();
+    *handles.layout.lock().unwrap() = Some(crate::test_support::appended_layout(2560));
+    let mut controller = Controller::new(backend, settings());
+    let mut opens = crate::pending_open::PendingOpens::default();
+    assert!(opens.enqueue(27, VIDEO, pending_open("video-8-capture"), 0));
+    opens
+        .poll(&host.runtime(), &mut controller, 0, false)
+        .unwrap();
+    host.ended.lock().unwrap().insert(27);
+    opens
+        .poll(&host.runtime(), &mut controller, 4_000, false)
+        .unwrap();
+    assert!(opens.is_empty());
+    let mut outbox = amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox::default();
+    controller.take_stream_issues(&mut outbox);
+    assert!(outbox.is_empty());
 }

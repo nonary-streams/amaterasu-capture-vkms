@@ -133,7 +133,8 @@ impl PresentationThread {
         let handle = thread::Builder::new()
             .name("vkms-presentation".into())
             .spawn(move || {
-                crate::threading::configure_capture_thread();
+                let priority = crate::threading::configure_capture_thread();
+                frames.report_priority(priority);
                 let snapshotter = match snapshotter.map(|create| create()).transpose() {
                     Ok(snapshotter) => snapshotter,
                     Err(_) => {
