@@ -455,7 +455,7 @@ impl Presenter {
             );
             // Emission uses the SDK's bounded nonblocking producer; loss of
             // diagnostics never blocks capture or changes frame ownership.
-            let _ = logger.emit(LogLevel::Info, "capture.presentation", &message);
+            let _ = logger.emit(LogLevel::Debug, "capture.presentation", &message);
         }
     }
 

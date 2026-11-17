@@ -72,6 +72,7 @@ fn presenter_reports_driver_gaps_through_sdk_logger_without_changing_delivery() 
     queue.flush(&runtime);
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["op"], "log");
+    assert_eq!(records[0]["level"], LogLevel::Debug as u8);
     assert_eq!(records[0]["target"], "capture.presentation");
     let message = records[0]["message"].as_str().unwrap();
     assert!(message.contains("stream=77 "));
