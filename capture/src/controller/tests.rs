@@ -729,3 +729,27 @@ fn a_limited_capture_priority_is_a_demoted_fallback() {
     assert_eq!(report["fallback"], "rlimit_nice");
     assert!(site(&report).contains("tests.rs:"), "{report}");
 }
+
+#[test]
+fn alternate_snapshot_layout_reports_once_per_capture_operation() {
+    use crate::snapshot::LayoutFallback;
+
+    let frames = StreamFrames::for_operation(41, 0, "video-4-capture".into());
+    frames.report_snapshot_layout(LayoutFallback::Scanout);
+    frames.report_snapshot_layout(LayoutFallback::Scanout);
+    frames.report_snapshot_layout(LayoutFallback::RenderOnly);
+    let mut outbox = StreamIssueOutbox::default();
+    frames.drain_issues(&mut outbox);
+    let reports: Vec<_> = outbox.drain().collect();
+    assert_eq!(reports.len(), 2);
+    for (report, fallback) in reports.iter().zip(["renderable_scanout", "render_only"]) {
+        let report = serde_json::to_value(report).unwrap();
+        assert_eq!(report["operation"], "video-4-capture");
+        assert_eq!(report["disposition"], "demoted_warning");
+        assert_eq!(report["code"], "snapshot_layout_fallback");
+        assert_eq!(report["reason"], "renderable_linear_layout_unavailable");
+        assert_eq!(report["requested"], "renderable_linear");
+        assert_eq!(report["effective"], fallback);
+        assert_eq!(report["fallback"], fallback);
+    }
+}

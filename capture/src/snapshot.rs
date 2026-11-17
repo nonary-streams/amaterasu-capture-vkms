@@ -103,6 +103,13 @@ impl Drop for SlotClaim {
     }
 }
 
+/// Layout selected after a renderable linear buffer could not be prepared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutFallback {
+    Scanout,
+    RenderOnly,
+}
+
 /// What one copy needed beyond the GPU draw itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CopyWork {
@@ -110,6 +117,7 @@ pub struct CopyWork {
     pub source_imported: bool,
     /// The destination buffer was (re)allocated for a new geometry/format.
     pub slot_allocated: bool,
+    pub layout_fallback: Option<LayoutFallback>,
     /// No completion fence was available; the copy finished on the CPU.
     pub synchronous: bool,
 }
@@ -153,6 +161,8 @@ mod platform {
     const COPY_UNSUPPORTED: i32 = -1;
     const SOURCE_CACHED: u32 = 1;
     const SLOT_ALLOCATED: u32 = 2;
+    const SCANOUT_LAYOUT: u32 = 4;
+    const RENDER_ONLY_LAYOUT: u32 = 8;
 
     #[repr(C)]
     struct Input {
@@ -311,6 +321,13 @@ mod platform {
                 work: CopyWork {
                     source_imported: copied.output.flags & SOURCE_CACHED == 0,
                     slot_allocated: copied.output.flags & SLOT_ALLOCATED != 0,
+                    layout_fallback: match copied.output.flags
+                        & (SCANOUT_LAYOUT | RENDER_ONLY_LAYOUT)
+                    {
+                        SCANOUT_LAYOUT => Some(LayoutFallback::Scanout),
+                        RENDER_ONLY_LAYOUT => Some(LayoutFallback::RenderOnly),
+                        _ => None,
+                    },
                     synchronous: false,
                 },
                 frame: ExportedFrame {

@@ -19,6 +19,8 @@ struct am_vkms_snapshotter;
 /* Output flags describing the work this copy needed. */
 #define AM_VKMS_SNAPSHOT_SOURCE_CACHED 1u
 #define AM_VKMS_SNAPSHOT_SLOT_ALLOCATED 2u
+#define AM_VKMS_SNAPSHOT_SCANOUT_LAYOUT 4u
+#define AM_VKMS_SNAPSHOT_RENDER_ONLY_LAYOUT 8u
 
 struct am_vkms_snapshot_input {
     uint32_t width;

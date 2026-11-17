@@ -7,7 +7,9 @@
 //! driver leases hold producer storage directly; optional GPU snapshots decouple
 //! capture from producer pacing. A consumed driver lease is never cached.
 use crate::{
-    admission::Admission, lifecycle_issues, snapshot::PooledSnapshot, snapshot::SlotClaim,
+    admission::Admission,
+    lifecycle_issues,
+    snapshot::{LayoutFallback, PooledSnapshot, SlotClaim},
     threading::CapturePriority,
 };
 use amaterasu_media::{
@@ -147,6 +149,7 @@ pub struct StreamFrames {
     operation: Option<String>,
     /// Only the first data-path failure of a stream is reported.
     failure_reported: AtomicBool,
+    snapshot_fallbacks_reported: AtomicU32,
     /// Issues the data path queued for the controller's next tick. Pushing
     /// and taking hold this lock briefly; nothing here publishes.
     issues: Mutex<StreamIssueOutbox>,
@@ -192,6 +195,7 @@ impl StreamFrames {
             fault: Mutex::new(None),
             operation: None,
             failure_reported: AtomicBool::new(false),
+            snapshot_fallbacks_reported: AtomicU32::new(0),
             issues: Mutex::new(StreamIssueOutbox::default()),
         }
     }
@@ -294,6 +298,28 @@ impl StreamFrames {
         if let Some(operation) = &self.operation
             && let Some(issue) = lifecycle_issues::priority_fallback(operation, priority)
         {
+            self.queue_issue(issue);
+        }
+    }
+
+    /// Report each alternate allocation layout once for this capture operation.
+    #[track_caller]
+    pub fn report_snapshot_layout(&self, fallback: LayoutFallback) {
+        let Some(operation) = self.operation.as_deref() else {
+            return;
+        };
+        let bit = match fallback {
+            LayoutFallback::Scanout => 1,
+            LayoutFallback::RenderOnly => 2,
+        };
+        if self
+            .snapshot_fallbacks_reported
+            .fetch_or(bit, Ordering::Relaxed)
+            & bit
+            == 0
+        {
+            let issue = lifecycle_issues::snapshot_layout_fallback(operation, fallback);
+            issue.log(None);
             self.queue_issue(issue);
         }
     }

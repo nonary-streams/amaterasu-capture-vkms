@@ -5,7 +5,7 @@
 //! first failure of a stream's data path and the fallbacks this provider
 //! chooses for a stream are reported under that operation with this module
 //! as the publisher.
-use crate::{frames::StreamFault, threading::CapturePriority};
+use crate::{frames::StreamFault, snapshot::LayoutFallback, threading::CapturePriority};
 use amaterasu_module_sdk::{
     stream_lifecycle::{LifecycleLayer, StreamIssue, StreamIssueOutbox, StreamReport},
     stream_warnings::WarningValue,
@@ -73,6 +73,26 @@ pub(crate) fn priority_fallback(operation: &str, priority: CapturePriority) -> O
         effective.map(|nice| WarningValue::Integer(i64::from(nice))),
     );
     Some(issue)
+}
+
+#[track_caller]
+pub(crate) fn snapshot_layout_fallback(operation: &str, layout: LayoutFallback) -> StreamIssue {
+    let fallback = match layout {
+        LayoutFallback::Scanout => "renderable_scanout",
+        LayoutFallback::RenderOnly => "render_only",
+    };
+    StreamIssue::demoted(
+        operation,
+        LifecycleLayer::Capture,
+        "vkms.snapshot",
+        "snapshot_layout_fallback",
+        fallback,
+    )
+    .because("renderable_linear_layout_unavailable")
+    .with_values(
+        Some(WarningValue::Label("renderable_linear".into())),
+        Some(WarningValue::Label(fallback.into())),
+    )
 }
 
 #[track_caller]

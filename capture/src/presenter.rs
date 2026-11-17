@@ -644,6 +644,9 @@ impl Presenter {
                 self.diagnostics.snapshot.record(started.elapsed());
                 self.copy_started = Some(started);
                 self.diagnostics.observe_copy(snapshot.work, retried);
+                if let Some(layout) = snapshot.work.layout_fallback {
+                    self.frames.report_snapshot_layout(layout);
+                }
                 self.frames.store_presented_snapshot(snapshot, presented);
                 self.diagnostics.publish_attempts =
                     self.diagnostics.publish_attempts.saturating_add(1);

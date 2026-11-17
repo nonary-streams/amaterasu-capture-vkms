@@ -273,28 +273,6 @@ static EGLImageKHR import_image(struct am_vkms_snapshotter *snapshotter,
 
 /* Some drivers expose AR30/XB30 but reject XR30. Try equivalent RGB layouts
  * at the requested precision; never fall back from ten bits to eight bits. */
-static struct gbm_bo *allocate_snapshot(struct gbm_device *device,
-                                        uint32_t width, uint32_t height,
-                                        uint32_t *format) {
-    static const uint32_t rgb8[] = {GBM_FORMAT_XRGB8888, GBM_FORMAT_ARGB8888,
-                                    GBM_FORMAT_XBGR8888, GBM_FORMAT_ABGR8888};
-    static const uint32_t rgb10[] = {GBM_FORMAT_XRGB2101010, GBM_FORMAT_ARGB2101010,
-                                     GBM_FORMAT_XBGR2101010, GBM_FORMAT_ABGR2101010};
-    const uint32_t *formats = *format == GBM_FORMAT_XRGB2101010 ? rgb10 : rgb8;
-    for (unsigned i = 0; i < 4; ++i) {
-        struct gbm_bo *buffer = gbm_bo_create(device, width, height, formats[i],
-                                             GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
-        if (buffer == NULL)
-            buffer = gbm_bo_create(device, width, height, formats[i], GBM_BO_USE_RENDERING);
-        if (buffer != NULL && gbm_bo_get_plane_count(buffer) == 1) {
-            *format = formats[i];
-            return buffer;
-        }
-        if (buffer != NULL) gbm_bo_destroy(buffer);
-    }
-    return NULL;
-}
-
 static uint32_t precision_format(uint32_t fourcc) {
     /* Keep the source's RGB precision. Ten-bit storage does not imply HDR:
      * transfer function and primaries remain the caller's separate contract.
@@ -326,16 +304,11 @@ static void release_slot(struct am_vkms_snapshotter *snapshotter, struct snapsho
     slot->fd = -1;
 }
 
-/* Allocates, exports and imports a slot once per geometry and precision.
- * A slot already matching the request is reused without any allocation. */
-static int prepare_slot(struct am_vkms_snapshotter *snapshotter, struct snapshot_slot *slot,
-                        uint32_t width, uint32_t height, uint32_t precision, bool *allocated) {
-    *allocated = false;
-    if (slot->buffer != NULL && slot->width == width && slot->height == height &&
-        slot->precision_format == precision) return AM_VKMS_SNAPSHOT_OK;
-    release_slot(snapshotter, slot);
-    uint32_t format = precision;
-    slot->buffer = allocate_snapshot(snapshotter->gbm, width, height, &format);
+static int prepare_renderable_slot(struct am_vkms_snapshotter *snapshotter,
+                                   struct snapshot_slot *slot, uint32_t width,
+                                   uint32_t height, uint32_t precision, uint32_t format,
+                                   uint32_t usage) {
+    slot->buffer = gbm_bo_create(snapshotter->gbm, width, height, format, usage);
     if (slot->buffer == NULL || gbm_bo_get_plane_count(slot->buffer) != 1) goto unsupported;
     slot->fd = gbm_bo_get_fd(slot->buffer);
     if (slot->fd < 0 || fcntl(slot->fd, F_SETFD, FD_CLOEXEC) != 0) goto unsupported;
@@ -374,10 +347,45 @@ static int prepare_slot(struct am_vkms_snapshotter *snapshotter, struct snapshot
     if (red_bits < required_bits || green_bits < required_bits || blue_bits < required_bits)
         goto unsupported;
     if (glGetError() != GL_NO_ERROR) goto unsupported;
-    *allocated = true;
     return AM_VKMS_SNAPSHOT_OK;
 unsupported:
     release_slot(snapshotter, slot);
+    return AM_VKMS_SNAPSHOT_UNSUPPORTED;
+}
+
+/* Allocate and import each slot once per geometry and precision. Scanout
+ * allocations provide a shareable tiled layout on drivers that cannot render
+ * to linear buffers. Render-only allocations are the last fallback. */
+static int prepare_slot(struct am_vkms_snapshotter *snapshotter, struct snapshot_slot *slot,
+                        uint32_t width, uint32_t height, uint32_t precision, uint32_t *allocation_flags) {
+    *allocation_flags = 0;
+    if (slot->buffer != NULL && slot->width == width && slot->height == height &&
+        slot->precision_format == precision) return AM_VKMS_SNAPSHOT_OK;
+
+    static const uint32_t rgb8[] = {GBM_FORMAT_XRGB8888, GBM_FORMAT_ARGB8888,
+                                    GBM_FORMAT_XBGR8888, GBM_FORMAT_ABGR8888};
+    static const uint32_t rgb10[] = {GBM_FORMAT_XRGB2101010, GBM_FORMAT_ARGB2101010,
+                                     GBM_FORMAT_XBGR2101010, GBM_FORMAT_ABGR2101010};
+    static const struct {
+        uint32_t usage;
+        uint32_t fallback_flag;
+    } layouts[] = {
+        {GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR, 0},
+        {GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT, AM_VKMS_SNAPSHOT_SCANOUT_LAYOUT},
+        {GBM_BO_USE_RENDERING, AM_VKMS_SNAPSHOT_RENDER_ONLY_LAYOUT}
+    };
+    const uint32_t *formats = precision == GBM_FORMAT_XRGB2101010 ? rgb10 : rgb8;
+
+    release_slot(snapshotter, slot);
+    for (unsigned layout = 0; layout < sizeof(layouts) / sizeof(layouts[0]); ++layout) {
+        for (unsigned i = 0; i < sizeof(rgb8) / sizeof(rgb8[0]); ++i) {
+            if (prepare_renderable_slot(snapshotter, slot, width, height, precision, formats[i],
+                                        layouts[layout].usage) == AM_VKMS_SNAPSHOT_OK) {
+                *allocation_flags = AM_VKMS_SNAPSHOT_SLOT_ALLOCATED | layouts[layout].fallback_flag;
+                return AM_VKMS_SNAPSHOT_OK;
+            }
+        }
+    }
     return AM_VKMS_SNAPSHOT_UNSUPPORTED;
 }
 
@@ -547,8 +555,8 @@ int am_vkms_snapshot_copy(struct am_vkms_snapshotter *snapshotter,
     struct cached_source *source = source_import(snapshotter, input, &cached);
     if (source == NULL) return AM_VKMS_SNAPSHOT_UNSUPPORTED;
     struct snapshot_slot *slot = &snapshotter->slots[input->slot];
-    bool allocated = false;
-    if (prepare_slot(snapshotter, slot, input->width, input->height, precision, &allocated) !=
+    uint32_t allocation_flags;
+    if (prepare_slot(snapshotter, slot, input->width, input->height, precision, &allocation_flags) !=
         AM_VKMS_SNAPSHOT_OK) return AM_VKMS_SNAPSHOT_UNSUPPORTED;
     int destination_fd = fcntl(slot->fd, F_DUPFD_CLOEXEC, 0);
     if (destination_fd < 0) return AM_VKMS_SNAPSHOT_BACKEND_ERROR;
@@ -582,8 +590,7 @@ int am_vkms_snapshot_copy(struct am_vkms_snapshotter *snapshotter,
     output->pitch = slot->pitch;
     output->fourcc = slot->fourcc;
     output->modifier = slot->modifier;
-    output->flags = (cached ? AM_VKMS_SNAPSHOT_SOURCE_CACHED : 0u) |
-                    (allocated ? AM_VKMS_SNAPSHOT_SLOT_ALLOCATED : 0u);
+    output->flags = (cached ? AM_VKMS_SNAPSHOT_SOURCE_CACHED : 0u) | allocation_flags;
     return AM_VKMS_SNAPSHOT_OK;
 }
 
