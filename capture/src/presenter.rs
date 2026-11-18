@@ -423,39 +423,42 @@ impl Presenter {
         }
         let window = std::mem::replace(&mut self.diagnostics, DiagnosticWindow::new(now));
         if let Some(logger) = &self.logger {
-            let message = format!(
-                "stream={} window_us={} final_window={} snapshot_enabled={} changed={} timeouts={} publish_attempts={} sequence_gaps={} export_ahead_sequences={} empty_exports={} pool_exhausted={} snapshot_retries={} source_imports={} slot_allocations={} synchronous_copies={} wait_calls={} wait_total_us={} wait_max_us={} export_calls={} export_total_us={} export_max_us={} snapshot_calls={} snapshot_total_us={} snapshot_max_us={} gpu_copy_calls={} gpu_copy_total_us={} gpu_copy_max_us={}",
-                self.stream_id,
-                now.saturating_duration_since(window.started).as_micros(),
-                final_window,
-                self.snapshotter.is_some(),
-                window.changed,
-                window.timeouts,
-                window.publish_attempts,
-                window.sequence_gaps,
-                window.export_ahead_sequences,
-                window.empty_exports,
-                window.pool_exhausted,
-                window.snapshot_retries,
-                window.source_imports,
-                window.slot_allocations,
-                window.synchronous_copies,
-                window.wait.count,
-                window.wait.total_us,
-                window.wait.max_us,
-                window.export.count,
-                window.export.total_us,
-                window.export.max_us,
-                window.snapshot.count,
-                window.snapshot.total_us,
-                window.snapshot.max_us,
-                window.gpu_copy.count,
-                window.gpu_copy.total_us,
-                window.gpu_copy.max_us,
-            );
+            let message = serde_json::json!({
+                "stream": self.stream_id,
+                "window_us": now.saturating_duration_since(window.started).as_micros(),
+                "final_window": final_window,
+                "snapshot_enabled": self.snapshotter.is_some(),
+                "changed": window.changed,
+                "timeouts": window.timeouts,
+                "publish_attempts": window.publish_attempts,
+                "sequence_gaps": window.sequence_gaps,
+                "export_ahead_sequences": window.export_ahead_sequences,
+                "empty_exports": window.empty_exports,
+                "pool_exhausted": window.pool_exhausted,
+                "snapshot_retries": window.snapshot_retries,
+                "source_imports": window.source_imports,
+                "slot_allocations": window.slot_allocations,
+                "synchronous_copies": window.synchronous_copies,
+                "wait_calls": window.wait.count,
+                "wait_total_us": window.wait.total_us,
+                "wait_max_us": window.wait.max_us,
+                "export_calls": window.export.count,
+                "export_total_us": window.export.total_us,
+                "export_max_us": window.export.max_us,
+                "snapshot_calls": window.snapshot.count,
+                "snapshot_total_us": window.snapshot.total_us,
+                "snapshot_max_us": window.snapshot.max_us,
+                "gpu_copy_calls": window.gpu_copy.count,
+                "gpu_copy_total_us": window.gpu_copy.total_us,
+                "gpu_copy_max_us": window.gpu_copy.max_us
+            });
             // Emission uses the SDK's bounded nonblocking producer; loss of
             // diagnostics never blocks capture or changes frame ownership.
-            let _ = logger.emit(LogLevel::Debug, "capture.presentation", &message);
+            let _ = logger.emit(
+                LogLevel::Debug,
+                "timing/capture.presentation",
+                &message.to_string(),
+            );
         }
     }
 

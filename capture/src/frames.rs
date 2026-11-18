@@ -319,7 +319,6 @@ impl StreamFrames {
             == 0
         {
             let issue = lifecycle_issues::snapshot_layout_fallback(operation, fallback);
-            issue.log(None);
             self.queue_issue(issue);
         }
     }

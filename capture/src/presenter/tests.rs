@@ -73,12 +73,13 @@ fn presenter_reports_driver_gaps_through_sdk_logger_without_changing_delivery() 
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["op"], "log");
     assert_eq!(records[0]["level"], LogLevel::Debug as u8);
-    assert_eq!(records[0]["target"], "capture.presentation");
-    let message = records[0]["message"].as_str().unwrap();
-    assert!(message.contains("stream=77 "));
-    assert!(message.contains("publish_attempts=2 "));
-    assert!(message.contains("sequence_gaps=2 "));
-    assert!(message.contains("export_ahead_sequences=1 "));
+    assert_eq!(records[0]["target"], "timing/capture.presentation");
+    let window: serde_json::Value =
+        serde_json::from_str(records[0]["message"].as_str().unwrap()).unwrap();
+    assert_eq!(window["stream"], 77);
+    assert_eq!(window["publish_attempts"], 2);
+    assert_eq!(window["sequence_gaps"], 2);
+    assert_eq!(window["export_ahead_sequences"], 1);
     presenter.log_diagnostics(started + Duration::from_secs(11), false);
     queue.flush(&runtime);
     assert_eq!(records.len(), 1);
@@ -89,9 +90,11 @@ fn presenter_reports_driver_gaps_through_sdk_logger_without_changing_delivery() 
     presenter.log_diagnostics(started + Duration::from_secs(11), true);
     queue.flush(&runtime);
     assert_eq!(records.len(), 2);
-    let final_message = records[1]["message"].as_str().unwrap();
-    assert!(final_message.contains("final_window=true "));
-    assert!(final_message.contains("wait_calls=1 wait_total_us=123 "));
+    let window: serde_json::Value =
+        serde_json::from_str(records[1]["message"].as_str().unwrap()).unwrap();
+    assert_eq!(window["final_window"], true);
+    assert_eq!(window["wait_calls"], 1);
+    assert_eq!(window["wait_total_us"], 123);
 }
 
 struct Running {
